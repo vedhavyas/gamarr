@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"gamarr/internal/fileops"
 	"gamarr/internal/qbit"
 )
 
@@ -107,9 +108,12 @@ func TestOrganizeNZBArchivesVaultFolder(t *testing.T) {
 
 	m.organizeNZBDownload(jobID, storage, "PC Game", "PC", "", true)
 
+	// The whole string, not a substring: the archive branch leaves the download
+	// in place, so claiming a move is wrong and only the verb says which
+	// happened.
 	job, _ := m.Jobs().Get(jobID)
-	if detail, _ := job["detail"].(string); !strings.Contains(detail, "GameVault") {
-		t.Errorf("detail = %q, want GameVault", detail)
+	if detail, _ := job["detail"].(string); detail != "Copied to GameVault" {
+		t.Errorf("detail = %q, want %q", detail, "Copied to GameVault")
 	}
 
 	// Read the archive rather than assert it exists: that is the only assertion
@@ -126,6 +130,18 @@ func TestOrganizeNZBArchivesVaultFolder(t *testing.T) {
 	}
 }
 
+// libraryPathFor returns the FilePath the library recorded for a source ID.
+func libraryPathFor(t *testing.T, m *Manager, sourceID string) string {
+	t.Helper()
+	for _, item := range m.Jobs().RecentLibraryItems(50) {
+		if item.SourceID == sourceID {
+			return item.FilePath
+		}
+	}
+	t.Fatalf("no library row for %q", sourceID)
+	return ""
+}
+
 // A restart can lose the job update after the archive landed. Re-running
 // organize has to finish the job: otherwise every retry reports the same
 // failure and the only way out is deleting the archive by hand.
@@ -136,7 +152,18 @@ func TestOrganizeGameCompletesWhenTheArchiveIsAlreadyThere(t *testing.T) {
 
 	content := filepath.Join(t.TempDir(), "Recovered Game")
 	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
-	writeFileT(t, filepath.Join(cfg.GamesVaultPath, "Recovered Game.tar"), []byte("published earlier"))
+	writeFileT(t, filepath.Join(content, "fg-01.bin"), []byte(strings.Repeat("payload", 512)))
+
+	// A real archive of this content, not a stand-in: the accept has to be
+	// distinguishable from any file happening to sit at that name.
+	staged := filepath.Join(t.TempDir(), "staged.tar")
+	if err := fileops.Archive(content, staged); err != nil {
+		t.Fatalf("build fixture archive: %v", err)
+	}
+	published := filepath.Join(cfg.GamesVaultPath, "Recovered Game.tar")
+	if err := os.Rename(staged, published); err != nil {
+		t.Fatalf("place fixture archive: %v", err)
+	}
 
 	qm := newQbitMock(t)
 	m := New(cfg, jobs, qm.client())
@@ -149,13 +176,139 @@ func TestOrganizeGameCompletesWhenTheArchiveIsAlreadyThere(t *testing.T) {
 	if status, _ := job["status"].(string); status != "completed" {
 		t.Errorf("status = %q, want completed (job=%v)", status, job)
 	}
-	if !m.Jobs().LibraryHasSourceID("torrent:h9") {
-		t.Error("the already-published archive was not tracked in the library")
+	// The row has to point at something that exists. A path nothing wrote reads
+	// as a stored game to whatever releases the download copy.
+	recorded := libraryPathFor(t, m, "torrent:h9")
+	if _, err := os.Stat(recorded); err != nil {
+		t.Errorf("library row FilePath %q does not exist: %v", recorded, err)
+	}
+	if recorded != published {
+		t.Errorf("library row FilePath = %q, want the archive at %q", recorded, published)
 	}
 	for _, call := range qm.deleteCalls() {
 		if call.deleteFiles {
 			t.Errorf("torrent %s was deleted with its data", call.hash)
 		}
+	}
+}
+
+// The accepted path has to be the occupant, not the name this import would have
+// written, and those two only differ when the vault holds the un-suffixed name.
+// An earlier single-file import of the same game lands exactly there, so a
+// folder-shaped release arriving later separates them.
+func TestOrganizeGameReportsTheOccupantNotTheArchiveName(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	jobs := newTestJobs(t)
+
+	content := filepath.Join(t.TempDir(), "Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+
+	// A regular file at the un-suffixed name, large enough to pass as this game.
+	occupant := filepath.Join(cfg.GamesVaultPath, "Game")
+	writeFileT(t, occupant, []byte(strings.Repeat("earlier single-file import", 64)))
+
+	qm := newQbitMock(t)
+	m := New(cfg, jobs, qm.client())
+	jobID := newJobID()
+	jobs.Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Game", Hash: "h7", ContentPath: content}, "PC", "", true)
+
+	job, _ := jobs.Get(jobID)
+	if status, _ := job["status"].(string); status != "completed" {
+		t.Fatalf("status = %q, want completed (job=%v)", status, job)
+	}
+	recorded := libraryPathFor(t, m, "torrent:h7")
+	if recorded != occupant {
+		t.Errorf("library row FilePath = %q, want the occupant %q", recorded, occupant)
+	}
+	if _, err := os.Stat(recorded); err != nil {
+		t.Errorf("library row FilePath %q does not exist: %v", recorded, err)
+	}
+	if pathExists(filepath.Join(cfg.GamesVaultPath, "Game.tar")) {
+		t.Error("reported a .tar the import never wrote")
+	}
+}
+
+// An occupant that cannot be an archive of this content is not this import.
+// Accepting one reports a game as stored that was never stored, and the library
+// row is what a release decision is read from.
+func TestOrganizeGameRefusesAnOccupantThatIsNotTheArchive(t *testing.T) {
+	cases := map[string]func(t *testing.T, vault string) string{
+		"a file too small to hold the source": func(t *testing.T, vault string) string {
+			p := filepath.Join(vault, "Game.tar")
+			writeFileT(t, p, []byte("not really an archive"))
+			return p
+		},
+		"a folder from an earlier unarchived import": func(t *testing.T, vault string) string {
+			p := filepath.Join(vault, "Game")
+			writeFileT(t, filepath.Join(p, "setup.exe"), []byte("old"))
+			return p
+		},
+	}
+	for name, seed := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := newTestConfig(t)
+			cfg.VaultArchiveEnabled = true
+			jobs := newTestJobs(t)
+			seed(t, cfg.GamesVaultPath)
+
+			content := filepath.Join(t.TempDir(), "Game")
+			writeFileT(t, filepath.Join(content, "setup.exe"), []byte(strings.Repeat("installer", 4096)))
+
+			qm := newQbitMock(t)
+			m := New(cfg, jobs, qm.client())
+			jobID := newJobID()
+			jobs.Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+			m.organizeGame(jobID, &qbit.Torrent{Name: "Game", Hash: "hx", ContentPath: content}, "PC", "", true)
+
+			job, _ := jobs.Get(jobID)
+			if status, _ := job["status"].(string); status != "error" {
+				t.Errorf("status = %q, want error (job=%v)", status, job)
+			}
+			if m.Jobs().LibraryHasSourceID("torrent:hx") {
+				t.Error("filed a library row for content that was never stored")
+			}
+		})
+	}
+}
+
+// Occupancy has to hold in both flag states. With the flag off the plain import
+// path used to write the folder beside an existing archive, storing one game
+// twice at full size under a single title.
+func TestOrganizeGameDoesNotStoreTwiceWithArchiveOff(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = false
+	jobs := newTestJobs(t)
+
+	content := filepath.Join(t.TempDir(), "Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	writeFileT(t, filepath.Join(cfg.GamesVaultPath, "Game.tar"), []byte(strings.Repeat("archived earlier", 64)))
+
+	qm := newQbitMock(t)
+	m := New(cfg, jobs, qm.client())
+	jobID := newJobID()
+	jobs.Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Game", Hash: "h8", ContentPath: content}, "PC", "", true)
+
+	if pathExists(filepath.Join(cfg.GamesVaultPath, "Game")) {
+		t.Error("stored the game a second time as a folder beside the archive")
+	}
+	entries, err := os.ReadDir(cfg.GamesVaultPath)
+	if err != nil {
+		t.Fatalf("read vault: %v", err)
+	}
+	var stored []string
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".gamarr.json") {
+			stored = append(stored, e.Name())
+		}
+	}
+	if len(stored) != 1 || stored[0] != "Game.tar" {
+		t.Errorf("vault holds %v, want only the archive already there", stored)
 	}
 }
 

@@ -148,7 +148,7 @@ func (s *Server) handleImportFiles(w http.ResponseWriter, r *http.Request) {
 			// returns where it sits, so file that. Matched on the error rather
 			// than its text, so a different failure carrying the same words
 			// cannot be filed as a successful import.
-			if !errors.Is(err, fileops.ErrArchiveExists) {
+			if !errors.Is(err, fileops.ErrDestinationOccupied) {
 				failures = append(failures, f.Path+": "+err.Error())
 				skipped++
 				continue

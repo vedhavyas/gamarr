@@ -5,7 +5,6 @@ package download
 import (
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -413,28 +412,56 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 // source, so an archive import is a copy: the download survives it whatever
 // IMPORT_MODE says, and the torrent is left seedable.
 func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
-	dest := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(src)))
+	base := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(src)))
+
+	// Occupancy is decided before either branch, and both take the same answer.
+	// Deciding it per branch is how the archive path came to refuse a duplicate
+	// while the plain path stored the same game a second time beside it.
+	if occ, done, occupied := acceptOccupiedVault(base, src); occupied {
+		if done {
+			return occ, fileops.ModeCopy, nil
+		}
+		return occ, fileops.ModeCopy, fmt.Errorf("%w: %s", fileops.ErrDestinationOccupied, occ)
+	}
+
 	if m.cfg.VaultArchiveEnabled && fileops.Archivable(src) {
-		dest = fileops.ArchiveDest(dest)
-		err := fileops.Archive(src, dest)
-		switch {
-		case err == nil:
-		case errors.Is(err, fileops.ErrArchiveExists):
-			// This program published it and then lost the job update to a
-			// restart. Re-running organize has to finish the job, or every retry
-			// reports the same failure and the only way out is deleting the
-			// archive by hand.
-			slog.Info("vault archive already present, treating the import as done",
-				"dest", sanitizeLog(dest))
-		default:
+		dest := fileops.ArchiveDest(base)
+		if err := fileops.Archive(src, dest); err != nil {
 			slog.Error("vault archive failed, download left in place",
 				"src", sanitizeLog(src), "dest", sanitizeLog(dest), "error", err)
 			return dest, fileops.ModeCopy, err
 		}
 		return dest, fileops.ModeCopy, nil
 	}
-	mode, err := m.importContent(src, dest)
-	return dest, mode, err
+	mode, err := m.importContent(src, base)
+	return base, mode, err
+}
+
+// acceptOccupiedVault decides what an already-occupied vault destination means
+// for an import of src: the occupant, whether the import counts as already done,
+// and whether anything was there at all.
+//
+// It returns the path that EXISTS, never the one this import would have written.
+// A library row aimed at a path nothing wrote reads as a stored game to whatever
+// releases download copies, so the two must not be confused.
+//
+// An occupant only counts as this import when it could be an archive of src.
+// "Something is at this name" also covers a stale archive of another build, a
+// truncated leftover and a hand-placed file, and accepting those reports content
+// as stored that was never stored.
+func acceptOccupiedVault(base, src string) (dest string, done, occupied bool) {
+	occ, exists := fileops.VaultOccupied(base)
+	if !exists {
+		return "", false, false
+	}
+	if fileops.ArchiveHolds(occ, src) {
+		// Either a crash lost the job update after publishing, or a collision was
+		// swallowed. This is the only trace of either.
+		slog.Warn("vault already holds this game, treating the import as done",
+			"dest", sanitizeLog(occ), "src", sanitizeLog(src))
+		return occ, true, true
+	}
+	return occ, false, true
 }
 
 // finishTorrent decides what happens to the torrent once its content is in the
@@ -1137,9 +1164,11 @@ func writeMetadataSidecar(destPath, title, platf, platSlug string, isPC bool, so
 func moveFile(src, dest string) error { return fileops.MoveFile(src, dest) }
 
 // moveContent moves a file or directory tree. Content Gamarr fetched itself
-// (DDL, Usenet) always moves: nothing is seeding it, so leaving the staging
-// copy behind would just leak disk. Torrent content goes through
-// Manager.importContent, which honors the configured import mode.
+// (DDL, Usenet) moves: nothing is seeding it, so leaving the staging copy behind
+// would just leak disk. Torrent content goes through Manager.importContent,
+// which honors the configured import mode. The one exception is a Usenet PC
+// download written to the vault as an archive, which cannot move bytes and so
+// leaves the staging copy for a layer that can confirm the archive is safe.
 func moveContent(src, dest string) error { return fileops.MoveContent(src, dest) }
 
 func copyFile(src, dest string) error { return fileops.CopyFile(src, dest) }

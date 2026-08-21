@@ -76,7 +76,7 @@ func (p *Pipeline) organizePC(sourcePath string) (string, error) {
 	// Checking only the selected layout stores the game twice, at full size,
 	// the first time the flag changes.
 	if occupied, exists := fileops.VaultOccupied(dest); exists {
-		return occupied, fmt.Errorf("%w: %s", fileops.ErrArchiveExists, occupied)
+		return occupied, fmt.Errorf("%w: %s", fileops.ErrDestinationOccupied, occupied)
 	}
 	if archive {
 		dest = fileops.ArchiveDest(dest)
@@ -106,13 +106,15 @@ func (p *Pipeline) organizeROM(sourcePath, platformSlug string) (string, error) 
 	baseName := filepath.Base(sourcePath)
 	dest := filepath.Join(destDir, baseName)
 
-	// Check duplicate.
+	// Same sentinel as the vault path. Reporting this with a bare error left the
+	// two indistinguishable by message while only one of them matched, so a ROM
+	// already on disk but missing from the library had no way back in.
 	if exists, _ := DuplicateCheck(dest); exists {
-		return dest, fmt.Errorf("already exists at destination: %s", dest)
+		return dest, fmt.Errorf("%w: %s", fileops.ErrDestinationOccupied, dest)
 	}
 
 	if err := p.importContent(sourcePath, dest); err != nil {
-		return sourcePath, err
+		return dest, err
 	}
 
 	slog.Info("ROM organized", "source", sourcePath, "dest", dest, "platform", platformSlug)

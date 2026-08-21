@@ -386,6 +386,25 @@ func TestSweepPartials(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
+	// A partial whose mtime a network mount reports ahead of local time is
+	// exactly the one a crash just left, so at minAge 0 age must not be
+	// consulted at all.
+	t.Run("minAge 0 ignores mtime entirely", func(t *testing.T) {
+		dir := t.TempDir()
+		future := filepath.Join(dir, ".Game.tar.789"+partialSuffix)
+		writeFile(t, future, "x")
+		ahead := time.Now().Add(time.Hour)
+		if err := os.Chtimes(future, ahead, ahead); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+		if n := SweepPartials(dir, 0); n != 1 {
+			t.Errorf("swept %d, want 1", n)
+		}
+		if _, err := os.Lstat(future); err == nil {
+			t.Error("a partial with a future mtime survived a floorless sweep")
+		}
+	})
+
 	if n := SweepPartials(vault, 24*time.Hour); n != 1 {
 		t.Errorf("swept %d, want 1", n)
 	}

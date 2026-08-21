@@ -259,8 +259,8 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		// already gone. When the content is sitting at its destination the
 		// import did succeed, so finish the job instead of reporting a
 		// completed import as a failure.
-		if dest, ok := m.nzbImportedDest(storagePath, platSlug, isPC); ok {
-			m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient)
+		if dest, mode, ok := m.nzbImportedDest(storagePath, platSlug, isPC); ok {
+			m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient, mode)
 			return
 		}
 		m.failNZBOrganize(jobID)
@@ -275,13 +275,35 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		})
 		return
 	}
-	if !isPC {
+	if isPC {
+		// Same decision, same helper as the torrent path: these two drifted once
+		// already, with one refusing a duplicate while the other stored it twice.
+		if occ, done, occupied := acceptOccupiedVault(dest, storagePath); occupied {
+			if done {
+				m.completeNZBOrganize(jobID, occ, title, platf, platSlug, isPC, sourceClient, fileops.ModeCopy)
+				return
+			}
+			m.jobs.UpdateMulti(jobID, map[string]interface{}{
+				"status": "error",
+				"error":  fmt.Sprintf("Organize failed: %v: %s", fileops.ErrDestinationOccupied, occ),
+			})
+			return
+		}
+	} else {
 		os.MkdirAll(filepath.Dir(dest), 0755)
 	}
 
 	archive := isPC && m.cfg.VaultArchiveEnabled && fileops.Archivable(storagePath)
+	// An archive leaves the download in staging, unlike the move it replaces, and
+	// it is deliberately not removed: a successful write to the vault says the
+	// bytes reached the mount's cache, not the remote behind it, so nothing at
+	// this layer can tell whether the archive is safe yet. Releasing the download
+	// copy belongs to whatever can read the remote. The mode carries that
+	// difference into the job detail, so the UI does not claim a move.
+	mode := fileops.ModeMove
 	var err error
 	if archive {
+		mode = fileops.ModeCopy
 		dest = fileops.ArchiveDest(dest)
 		err = fileops.Archive(storagePath, dest)
 	} else {
@@ -299,32 +321,30 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		return
 	}
 
-	// An archive leaves the download in staging, unlike the move it replaces. It
-	// is deliberately not removed here: a successful write to the vault says the
-	// bytes reached the mount's cache, not the remote behind it, so nothing at
-	// this layer can tell whether the archive is safe yet. Releasing the
-	// download copy belongs to whatever can read the remote.
-	m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient)
+	m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient, mode)
 }
 
 // nzbImportedDest finds content that already reached the library when the
 // staging path is gone. Both vault layouts are checked, since the archive
 // option may have been toggled between the import and a restart that
 // re-enters organize.
-func (m *Manager) nzbImportedDest(storagePath, platSlug string, isPC bool) (string, bool) {
+func (m *Manager) nzbImportedDest(storagePath, platSlug string, isPC bool) (string, fileops.Mode, bool) {
 	dest, ok := m.nzbDestPath(storagePath, platSlug, isPC)
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	if pathExists(dest) {
-		return dest, true
+		return dest, fileops.ModeMove, true
 	}
 	if isPC {
+		// An archive import is always a copy, so the verb has to say so even on
+		// the recovery route. Staging is gone here, so nothing can check the
+		// archive against it: the name is all there is to go on.
 		if archived := fileops.ArchiveDest(dest); pathExists(archived) {
-			return archived, true
+			return archived, fileops.ModeCopy, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 // nzbDestPath returns the library destination for a finished Usenet download.
@@ -352,14 +372,14 @@ func (m *Manager) failNZBOrganize(jobID string) {
 // completeNZBOrganize marks the job done and registers the content in the
 // library. TrackInLibrary dedupes on source ID, so re-entering this after a
 // restart is safe.
-func (m *Manager) completeNZBOrganize(jobID, dest, title, platf, platSlug string, isPC bool, sourceClient string) {
+func (m *Manager) completeNZBOrganize(jobID, dest, title, platf, platSlug string, isPC bool, sourceClient string, mode fileops.Mode) {
 	label := "GameVault"
 	if !isPC {
 		label = fmt.Sprintf("RomM (%s)", platf)
 	}
 	m.jobs.UpdateMulti(jobID, map[string]interface{}{
 		"status": "completed",
-		"detail": fmt.Sprintf("Moved to %s", label),
+		"detail": importDetail(mode, label),
 	})
 	writeMetadataSidecar(dest, title, platf, platSlug, isPC, "nzb")
 	m.TrackInLibrary(title, platf, platSlug, isPC, dest, 0, "nzb", sourceClient, "nzb:"+dest)

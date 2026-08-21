@@ -1,12 +1,14 @@
 package organize
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"gamarr/internal/config"
+	"gamarr/internal/fileops"
 )
 
 func newArchivePipeline(t *testing.T) (*Pipeline, string) {
@@ -76,6 +78,41 @@ func TestOrganizePCRefusesEitherLayout(t *testing.T) {
 					names[i] = e.Name()
 				}
 				t.Errorf("vault holds %v, want only the copy that was already there", names)
+			}
+		})
+	}
+}
+
+// Both library paths report an occupied destination with the same sentinel. They
+// used to differ while carrying the same words, so a caller matching the error
+// handled the PC case and silently failed the ROM one - which is the case a
+// crash between organizing and filing the library row lands in.
+func TestOccupiedDestinationIsTheSameErrorOnBothPaths(t *testing.T) {
+	p, vault := newFlaggedPipeline(t, false)
+	roms := filepath.Join(filepath.Dir(vault), "roms")
+
+	writeFile(t, filepath.Join(vault, "Game", "setup.exe"), "OLD")
+	writeFile(t, filepath.Join(roms, "snes", "Game.sfc"), "OLD")
+
+	pcSrc := filepath.Join(t.TempDir(), "Game")
+	writeFile(t, filepath.Join(pcSrc, "setup.exe"), "NEW")
+	romSrc := filepath.Join(t.TempDir(), "Game.sfc")
+	writeFile(t, romSrc, "NEW")
+
+	for _, tt := range []struct {
+		name string
+		run  func() (string, error)
+	}{
+		{"pc", func() (string, error) { return p.OrganizeGame(pcSrc, "PC", "", true) }},
+		{"rom", func() (string, error) { return p.OrganizeGame(romSrc, "SNES", "snes", false) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dest, err := tt.run()
+			if !errors.Is(err, fileops.ErrDestinationOccupied) {
+				t.Errorf("err = %v, want ErrDestinationOccupied", err)
+			}
+			if _, statErr := os.Stat(dest); statErr != nil {
+				t.Errorf("dest = %q does not exist: %v", dest, statErr)
 			}
 		})
 	}

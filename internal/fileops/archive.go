@@ -20,11 +20,10 @@ const TarExt = ".tar"
 // partialSuffix marks an archive that is still being written.
 const partialSuffix = ".partial"
 
-// ErrArchiveExists reports that the vault already holds this game, in either
-// layout. Callers separate it from a real failure: on the automatic paths an
-// archive already at the destination is one this program published before a
-// restart lost the job update, which is a finished import rather than an error.
-var ErrArchiveExists = errors.New("already exists at destination")
+// ErrDestinationOccupied reports that the library already holds something at
+// this destination. One sentinel covers the vault in either layout and the ROM
+// library, so a caller cannot match one path and miss the other.
+var ErrDestinationOccupied = errors.New("already exists at destination")
 
 // ArchiveDest returns the archive path for a vault destination.
 func ArchiveDest(dest string) string { return dest + TarExt }
@@ -45,6 +44,24 @@ func VaultOccupied(base string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// ArchiveHolds reports whether path could be an archive of src: a regular file
+// at least as large as src's payload.
+//
+// A necessary condition, not proof, and that is the point. "Something is at this
+// name" is not evidence that this content was ever published there, and a caller
+// that reports a finished import on that basis hands a release decision to a
+// layer that acts on it. An uncompressed tar cannot be smaller than the files it
+// holds, so a short occupant, a directory, or a hand-placed file is definitely
+// not ours.
+func ArchiveHolds(path, src string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	_, wantBytes, err := censusOf(src)
+	return err == nil && fi.Size() >= wantBytes
 }
 
 // partialPattern is the os.CreateTemp pattern for an in-progress archive. The
@@ -104,7 +121,7 @@ func Archive(src, dest string) error {
 		return fmt.Errorf("refusing to archive %s: it holds no regular files", src)
 	}
 	if occupied, ok := VaultOccupied(strings.TrimSuffix(dest, TarExt)); ok {
-		return fmt.Errorf("%w: %s", ErrArchiveExists, occupied)
+		return fmt.Errorf("%w: %s", ErrDestinationOccupied, occupied)
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return err
@@ -179,7 +196,11 @@ func SweepPartials(dir string, minAge time.Duration) int {
 			slog.Warn("could not stat a partial archive", "dir", dir, "name", name, "error", err)
 			continue
 		}
-		if info.ModTime().After(cutoff) {
+		// At minAge 0 the caller has established nothing is in flight, so age
+		// carries no information. Comparing anyway would spare a partial whose
+		// mtime a network mount reports a few seconds ahead of local time, which
+		// is exactly the one the crash just left.
+		if minAge > 0 && info.ModTime().After(cutoff) {
 			continue
 		}
 		path := filepath.Join(dir, name)
