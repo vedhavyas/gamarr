@@ -288,23 +288,38 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		err = moveContent(storagePath, dest)
 	}
 	if err != nil {
+		if archive {
+			slog.Error("vault archive failed, staging left in place",
+				"src", storagePath, "dest", dest, "error", err)
+		}
 		m.jobs.UpdateMulti(jobID, map[string]interface{}{
 			"status": "error",
 			"error":  fmt.Sprintf("Organize failed: %v", err),
 		})
 		return
 	}
+
+	// Archive returns only once every source file is in the tar and the tar is
+	// durable under its final name, which is what makes dropping staging safe;
+	// a successful rename on its own would not be. The move this replaced
+	// consumed staging anyway.
+	var stagingErr error
 	if archive {
-		// Archive returns only once the tar is renamed off .partial, which is
-		// what makes dropping staging safe here; the move this replaced would
-		// have consumed it anyway.
-		if err := os.RemoveAll(storagePath); err != nil {
-			slog.Warn("could not remove usenet staging after archiving",
-				"path", storagePath, "error", err)
+		if stagingErr = os.RemoveAll(storagePath); stagingErr != nil {
+			slog.Error("could not remove usenet staging after archiving",
+				"path", storagePath, "error", stagingErr)
 		}
 	}
 
 	m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient)
+
+	// The import succeeded, so this is not a failed job, but a remnant in
+	// staging is disk nothing else reclaims and it has to be visible somewhere
+	// other than the log.
+	if stagingErr != nil {
+		m.jobs.Update(jobID, "detail", fmt.Sprintf(
+			"Moved to GameVault. Could not remove the download copy at %s: %v", storagePath, stagingErr))
+	}
 }
 
 // nzbImportedDest finds content that already reached the library when the

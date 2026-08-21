@@ -347,6 +347,11 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 		}
 	}
 
+	// This if/else is the entire ROM guarantee. is_pc arrives unvalidated on
+	// several request bodies and is never cross-checked against platform_slug,
+	// so a caller can route a ROM here; nothing but this single branch keeps ROM
+	// content out of the vault. Do not restructure it into a form that can reach
+	// both arms.
 	var importMode fileops.Mode
 	if isPC {
 		dest, mode, err := m.importToVault(contentPath)
@@ -410,7 +415,12 @@ func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
 	dest := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(src)))
 	if m.cfg.VaultArchiveEnabled && fileops.Archivable(src) {
 		dest = fileops.ArchiveDest(dest)
-		return dest, fileops.ModeCopy, fileops.Archive(src, dest)
+		if err := fileops.Archive(src, dest); err != nil {
+			slog.Error("vault archive failed, download left in place",
+				"src", sanitizeLog(src), "dest", sanitizeLog(dest), "error", err)
+			return dest, fileops.ModeCopy, err
+		}
+		return dest, fileops.ModeCopy, nil
 	}
 	mode, err := m.importContent(src, dest)
 	return dest, mode, err
