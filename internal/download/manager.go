@@ -349,8 +349,7 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 
 	var importMode fileops.Mode
 	if isPC {
-		dest := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(contentPath)))
-		mode, err := m.importContent(contentPath, dest)
+		dest, mode, err := m.importToVault(contentPath)
 		importMode = mode
 		if err != nil {
 			m.jobs.UpdateMulti(jobID, map[string]interface{}{
@@ -398,6 +397,23 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 	}
 
 	m.finishTorrent(torrentHash, torrentName, importMode)
+}
+
+// importToVault places finished PC content in the vault and reports the path it
+// landed at along with the mode that got it there.
+//
+// Under VAULT_ARCHIVE_ENABLED a directory is written as a single tar instead of
+// being imported as a folder. Writing a new archive cannot move or hardlink the
+// source, so an archive import is a copy: the download survives it whatever
+// IMPORT_MODE says, and the torrent is left seedable.
+func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
+	dest := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(src)))
+	if m.cfg.VaultArchiveEnabled && fileops.Archivable(src) {
+		dest = fileops.ArchiveDest(dest)
+		return dest, fileops.ModeCopy, fileops.Archive(src, dest)
+	}
+	mode, err := m.importContent(src, dest)
+	return dest, mode, err
 }
 
 // finishTorrent decides what happens to the torrent once its content is in the

@@ -27,7 +27,8 @@ func NewPipeline(cfg *config.Config) *Pipeline {
 
 // OrganizeGame moves a downloaded game file to the appropriate library directory.
 // For ROMs: {roms_path}/{platform_slug}/{cleaned_filename}
-// For PC games: {vault_path}/{game_name}/
+// For PC games: {vault_path}/{game_name}/, or {vault_path}/{game_name}.tar
+// under VAULT_ARCHIVE_ENABLED
 func (p *Pipeline) OrganizeGame(sourcePath, platform, platformSlug string, isPC bool) (string, error) {
 	if _, err := os.Stat(sourcePath); err != nil {
 		return "", fmt.Errorf("source path not found: %s", sourcePath)
@@ -67,12 +68,23 @@ func (p *Pipeline) organizePC(sourcePath string) (string, error) {
 	// component so it cannot escape the vault dir.
 	dest := filepath.Join(destDir, filepath.Base(cleanName))
 
+	// GameVault indexes one file per game, so under VAULT_ARCHIVE_ENABLED a
+	// directory becomes a single tar rather than a folder it would misread.
+	archive := p.cfg.VaultArchiveEnabled && fileops.Archivable(sourcePath)
+	if archive {
+		dest = fileops.ArchiveDest(dest)
+	}
+
 	// Check duplicate.
 	if exists, _ := DuplicateCheck(dest); exists {
 		return dest, fmt.Errorf("already exists at destination: %s", dest)
 	}
 
-	if err := p.importContent(sourcePath, dest); err != nil {
+	if archive {
+		if err := fileops.Archive(sourcePath, dest); err != nil {
+			return sourcePath, err
+		}
+	} else if err := p.importContent(sourcePath, dest); err != nil {
 		return sourcePath, err
 	}
 

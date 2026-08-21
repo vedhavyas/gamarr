@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"gamarr/internal/fileops"
 	"gamarr/internal/nzbget"
 	"gamarr/internal/sabnzbd"
 )
@@ -258,7 +259,7 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		// already gone. When the content is sitting at its destination the
 		// import did succeed, so finish the job instead of reporting a
 		// completed import as a failure.
-		if dest, ok := m.nzbDestPath(storagePath, platSlug, isPC); ok && pathExists(dest) {
+		if dest, ok := m.nzbImportedDest(storagePath, platSlug, isPC); ok {
 			m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient)
 			return
 		}
@@ -278,15 +279,52 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		os.MkdirAll(filepath.Dir(dest), 0755)
 	}
 
-	if err := moveContent(storagePath, dest); err != nil {
+	archive := isPC && m.cfg.VaultArchiveEnabled && fileops.Archivable(storagePath)
+	var err error
+	if archive {
+		dest = fileops.ArchiveDest(dest)
+		err = fileops.Archive(storagePath, dest)
+	} else {
+		err = moveContent(storagePath, dest)
+	}
+	if err != nil {
 		m.jobs.UpdateMulti(jobID, map[string]interface{}{
 			"status": "error",
 			"error":  fmt.Sprintf("Organize failed: %v", err),
 		})
 		return
 	}
+	if archive {
+		// Archive returns only once the tar is renamed off .partial, which is
+		// what makes dropping staging safe here; the move this replaced would
+		// have consumed it anyway.
+		if err := os.RemoveAll(storagePath); err != nil {
+			slog.Warn("could not remove usenet staging after archiving",
+				"path", storagePath, "error", err)
+		}
+	}
 
 	m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient)
+}
+
+// nzbImportedDest finds content that already reached the library when the
+// staging path is gone. Both vault layouts are checked, since the archive
+// option may have been toggled between the import and a restart that
+// re-enters organize.
+func (m *Manager) nzbImportedDest(storagePath, platSlug string, isPC bool) (string, bool) {
+	dest, ok := m.nzbDestPath(storagePath, platSlug, isPC)
+	if !ok {
+		return "", false
+	}
+	if pathExists(dest) {
+		return dest, true
+	}
+	if isPC {
+		if archived := fileops.ArchiveDest(dest); pathExists(archived) {
+			return archived, true
+		}
+	}
+	return "", false
 }
 
 // nzbDestPath returns the library destination for a finished Usenet download.
