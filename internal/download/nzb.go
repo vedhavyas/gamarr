@@ -299,27 +299,12 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		return
 	}
 
-	// Archive returns only once every source file is in the tar and the tar is
-	// durable under its final name, which is what makes dropping staging safe;
-	// a successful rename on its own would not be. The move this replaced
-	// consumed staging anyway.
-	var stagingErr error
-	if archive {
-		if stagingErr = os.RemoveAll(storagePath); stagingErr != nil {
-			slog.Error("could not remove usenet staging after archiving",
-				"path", storagePath, "error", stagingErr)
-		}
-	}
-
+	// An archive leaves the download in staging, unlike the move it replaces. It
+	// is deliberately not removed here: a successful write to the vault says the
+	// bytes reached the mount's cache, not the remote behind it, so nothing at
+	// this layer can tell whether the archive is safe yet. Releasing the
+	// download copy belongs to whatever can read the remote.
 	m.completeNZBOrganize(jobID, dest, title, platf, platSlug, isPC, sourceClient)
-
-	// The import succeeded, so this is not a failed job, but a remnant in
-	// staging is disk nothing else reclaims and it has to be visible somewhere
-	// other than the log.
-	if stagingErr != nil {
-		m.jobs.Update(jobID, "detail", fmt.Sprintf(
-			"Moved to GameVault. Could not remove the download copy at %s: %v", storagePath, stagingErr))
-	}
 }
 
 // nzbImportedDest finds content that already reached the library when the

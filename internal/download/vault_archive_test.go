@@ -112,15 +112,50 @@ func TestOrganizeNZBArchivesVaultFolder(t *testing.T) {
 		t.Errorf("detail = %q, want GameVault", detail)
 	}
 
-	// Read the archive before trusting the deletion: this is the only assertion
-	// that distinguishes a real import from one that archived nothing and then
-	// removed the only copy.
+	// Read the archive rather than assert it exists: that is the only assertion
+	// separating a real import from one that archived nothing.
 	got := tarEntries(t, filepath.Join(cfg.GamesVaultPath, "PC Game.tar"))
 	if got["setup.exe"] != "installer" || got["data/fg-01.bin"] != "payload" {
 		t.Errorf("archive contents = %v, want both source files", got)
 	}
-	if pathExists(storage) {
-		t.Error("usenet staging survived the archive")
+	// A write to the vault reaches the mount's cache, not the remote behind it,
+	// so nothing here can tell whether the archive is safe. The download copy
+	// stays for a layer that can read the remote to release.
+	if !pathExists(filepath.Join(storage, "setup.exe")) {
+		t.Error("the download copy was removed on the strength of a local write")
+	}
+}
+
+// A restart can lose the job update after the archive landed. Re-running
+// organize has to finish the job: otherwise every retry reports the same
+// failure and the only way out is deleting the archive by hand.
+func TestOrganizeGameCompletesWhenTheArchiveIsAlreadyThere(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	jobs := newTestJobs(t)
+
+	content := filepath.Join(t.TempDir(), "Recovered Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	writeFileT(t, filepath.Join(cfg.GamesVaultPath, "Recovered Game.tar"), []byte("published earlier"))
+
+	qm := newQbitMock(t)
+	m := New(cfg, jobs, qm.client())
+	jobID := newJobID()
+	jobs.Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Recovered Game", Hash: "h9", ContentPath: content}, "PC", "", true)
+
+	job, _ := jobs.Get(jobID)
+	if status, _ := job["status"].(string); status != "completed" {
+		t.Errorf("status = %q, want completed (job=%v)", status, job)
+	}
+	if !m.Jobs().LibraryHasSourceID("torrent:h9") {
+		t.Error("the already-published archive was not tracked in the library")
+	}
+	for _, call := range qm.deleteCalls() {
+		if call.deleteFiles {
+			t.Errorf("torrent %s was deleted with its data", call.hash)
+		}
 	}
 }
 
@@ -147,36 +182,6 @@ func TestOrganizeNZBKeepsStagingWhenArchiveFails(t *testing.T) {
 	}
 	if pathExists(filepath.Join(cfg.GamesVaultPath, "PC Game.tar")) {
 		t.Error("a failed archive was published to the vault")
-	}
-}
-
-// A remnant left in staging is disk nothing else reclaims, so it has to be
-// visible on the job and not only in the log.
-func TestOrganizeNZBReportsAnUnremovableStagingCopy(t *testing.T) {
-	cfg := newTestConfig(t)
-	cfg.VaultArchiveEnabled = true
-	m := New(cfg, newTestJobs(t), nil)
-	jobID := newJobID()
-	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
-
-	parent := t.TempDir()
-	storage := filepath.Join(parent, "PC Game")
-	writeFileT(t, filepath.Join(storage, "setup.exe"), []byte("installer"))
-	// Removing an entry needs write on its parent directory.
-	if err := os.Chmod(parent, 0500); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	t.Cleanup(func() { os.Chmod(parent, 0700) })
-
-	m.organizeNZBDownload(jobID, storage, "PC Game", "PC", "", true)
-
-	job, _ := m.Jobs().Get(jobID)
-	if status, _ := job["status"].(string); status != "completed" {
-		t.Errorf("status = %q, want completed: the import did succeed", status)
-	}
-	detail, _ := job["detail"].(string)
-	if !strings.Contains(detail, "Could not remove") {
-		t.Errorf("detail = %q, want it to report the leftover download copy", detail)
 	}
 }
 

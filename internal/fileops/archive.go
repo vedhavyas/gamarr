@@ -20,14 +20,32 @@ const TarExt = ".tar"
 // partialSuffix marks an archive that is still being written.
 const partialSuffix = ".partial"
 
-// ErrArchiveExists is returned rather than replacing an archive already in the
-// vault. Publishing an archive is an atomic and total rename, unlike the
-// directory merge it replaced, so overwriting would discard a complete game
-// with nothing left to notice it by.
-var ErrArchiveExists = errors.New("an archive already exists at the destination")
+// ErrArchiveExists reports that the vault already holds this game, in either
+// layout. Callers separate it from a real failure: on the automatic paths an
+// archive already at the destination is one this program published before a
+// restart lost the job update, which is a finished import rather than an error.
+var ErrArchiveExists = errors.New("already exists at destination")
 
 // ArchiveDest returns the archive path for a vault destination.
 func ArchiveDest(dest string) string { return dest + TarExt }
+
+// VaultOccupied reports the path already holding base, checking both layouts: a
+// folder from an unarchived import and an archive from an archived one.
+//
+// Checking only the layout the archive flag currently selects stores the same
+// game twice at full size, on the exact operation an operator performs when
+// adopting the flag: turn it on, re-import something already there.
+//
+// Content placed in the vault by anything other than Gamarr is out of scope: on
+// a cached mount this reads a directory listing that can be badly stale.
+func VaultOccupied(base string) (string, bool) {
+	for _, p := range []string{base, ArchiveDest(base)} {
+		if _, err := os.Lstat(p); err == nil {
+			return p, true
+		}
+	}
+	return "", false
+}
 
 // partialPattern is the os.CreateTemp pattern for an in-progress archive. The
 // leading dot is load-bearing: it keeps a partial out of Gamarr's own vault
@@ -68,23 +86,25 @@ func Archivable(src string) bool {
 // The tar is a pure container, never compressed: a repack's payload is already
 // compressed, so a second pass costs hours of CPU for no size change.
 //
-// A nil return means every regular file under src is in the archive and the
-// archive is on the backing store under its final name. Callers that delete the
-// source afterwards depend on precisely that, and a successful rename(2) does
-// not imply it, so the result is checked against a pre-walk census and synced
-// before it is published.
+// A nil return means every regular file under src reached the archive and the
+// archive is published at dest, on a name nothing else held. It does not mean
+// the bytes are safe on whatever backs the vault: the sync below reaches the
+// vault's own storage, which on an rclone mount is a local cache file, and the
+// upload to the remote happens afterwards and asynchronously, with failures
+// retried and logged somewhere Gamarr cannot read. Nothing may treat this
+// return as authority to delete the source.
 func Archive(src, dest string) error {
 	defer lockDest(dest)()
 
-	wantFiles, wantBytes, err := census(src)
+	wantFiles, wantBytes, err := censusOf(src)
 	if err != nil {
 		return err
 	}
 	if wantFiles == 0 {
 		return fmt.Errorf("refusing to archive %s: it holds no regular files", src)
 	}
-	if _, err := os.Lstat(dest); err == nil {
-		return fmt.Errorf("%w: %s", ErrArchiveExists, dest)
+	if occupied, ok := VaultOccupied(strings.TrimSuffix(dest, TarExt)); ok {
+		return fmt.Errorf("%w: %s", ErrArchiveExists, occupied)
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return err
@@ -104,9 +124,15 @@ func Archive(src, dest string) error {
 			src, gotFiles, gotBytes, wantFiles, wantBytes)
 	}
 	if err == nil {
-		// The vault can be a cache in front of a remote, where close(2) returns
-		// long before the bytes are durable and the writeback error arrives
-		// after this function has already said yes.
+		// CreateTemp makes the file 0600 and is not subject to umask, and
+		// GameVault reads the vault from another container: a mode only this uid
+		// can read publishes a game nothing else can open. Every other import
+		// path carries the source's mode over; this one has to pick.
+		err = f.Chmod(0644)
+	}
+	if err == nil {
+		// Pushes the page cache into the vault's own storage before the rename
+		// publishes the name. Not durability on a cached mount; see above.
 		err = f.Sync()
 	}
 	if cerr := f.Close(); err == nil {
@@ -136,6 +162,9 @@ func removePartial(path string) {
 func SweepPartials(dir string, minAge time.Duration) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		// Otherwise indistinguishable from a vault with nothing to sweep, and a
+		// listing failure is realistic on a network-backed mount.
+		slog.Warn("could not scan the vault for abandoned partial archives", "dir", dir, "error", err)
 		return 0
 	}
 	cutoff := time.Now().Add(-minAge)
@@ -146,7 +175,11 @@ func SweepPartials(dir string, minAge time.Duration) int {
 			continue
 		}
 		info, err := e.Info()
-		if err != nil || info.ModTime().After(cutoff) {
+		if err != nil {
+			slog.Warn("could not stat a partial archive", "dir", dir, "name", name, "error", err)
+			continue
+		}
+		if info.ModTime().After(cutoff) {
 			continue
 		}
 		path := filepath.Join(dir, name)
@@ -159,6 +192,11 @@ func SweepPartials(dir string, minAge time.Duration) int {
 	}
 	return removed
 }
+
+// censusOf indirects census so a test can make the census and the walk disagree.
+// The count comparison is the whole of the verification and is otherwise
+// unreachable, since the zero case has its own guard.
+var censusOf = census
 
 // census counts the regular files under src and their total size: the figures a
 // finished archive has to match before it can stand in for the source.

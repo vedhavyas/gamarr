@@ -5,10 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"gamarr/internal/db"
-	"gamarr/internal/fileops"
 )
 
 // ScanLibraryDirs scans vault and ROM directories to populate the library.
@@ -20,10 +18,6 @@ func (m *Manager) ScanLibraryDirs() {
 
 	// Scan PC games vault — each top-level entry is one game (no recursion)
 	if m.cfg.GamesVaultPath != "" {
-		// A partial archive gets a unique name, so one abandoned by a crash is
-		// never reclaimed by the next attempt. The age floor keeps the sweep
-		// clear of an import still writing.
-		fileops.SweepPartials(m.cfg.GamesVaultPath, 24*time.Hour)
 		n := m.scanVault(m.cfg.GamesVaultPath)
 		total += n
 	}

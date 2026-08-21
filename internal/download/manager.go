@@ -5,6 +5,7 @@ package download
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -415,7 +416,17 @@ func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
 	dest := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(src)))
 	if m.cfg.VaultArchiveEnabled && fileops.Archivable(src) {
 		dest = fileops.ArchiveDest(dest)
-		if err := fileops.Archive(src, dest); err != nil {
+		err := fileops.Archive(src, dest)
+		switch {
+		case err == nil:
+		case errors.Is(err, fileops.ErrArchiveExists):
+			// This program published it and then lost the job update to a
+			// restart. Re-running organize has to finish the job, or every retry
+			// reports the same failure and the only way out is deleting the
+			// archive by hand.
+			slog.Info("vault archive already present, treating the import as done",
+				"dest", sanitizeLog(dest))
+		default:
 			slog.Error("vault archive failed, download left in place",
 				"src", sanitizeLog(src), "dest", sanitizeLog(dest), "error", err)
 			return dest, fileops.ModeCopy, err

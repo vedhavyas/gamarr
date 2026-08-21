@@ -71,21 +71,26 @@ func (p *Pipeline) organizePC(sourcePath string) (string, error) {
 	// GameVault indexes one file per game, so under VAULT_ARCHIVE_ENABLED a
 	// directory becomes a single tar rather than a folder it would misread.
 	archive := p.cfg.VaultArchiveEnabled && fileops.Archivable(sourcePath)
+
+	// Both layouts count as occupied, whichever one this import would write.
+	// Checking only the selected layout stores the game twice, at full size,
+	// the first time the flag changes.
+	if occupied, exists := fileops.VaultOccupied(dest); exists {
+		return occupied, fmt.Errorf("%w: %s", fileops.ErrArchiveExists, occupied)
+	}
 	if archive {
 		dest = fileops.ArchiveDest(dest)
 	}
 
-	// Check duplicate.
-	if exists, _ := DuplicateCheck(dest); exists {
-		return dest, fmt.Errorf("already exists at destination: %s", dest)
-	}
-
 	if archive {
 		if err := fileops.Archive(sourcePath, dest); err != nil {
-			return sourcePath, err
+			// dest, not sourcePath: a caller that files this in the library on an
+			// already-exists error would otherwise record the download staging
+			// path, which is a row pointing at something meant to be released.
+			return dest, err
 		}
 	} else if err := p.importContent(sourcePath, dest); err != nil {
-		return sourcePath, err
+		return dest, err
 	}
 
 	slog.Info("PC game organized", "source", sourcePath, "dest", dest)

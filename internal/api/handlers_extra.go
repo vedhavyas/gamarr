@@ -197,12 +197,6 @@ func (s *Server) handleImportCheck(w http.ResponseWriter, r *http.Request) {
 		if t.dest == "" {
 			continue
 		}
-		// Archiving writes a new tar into the vault, which is a copy whatever
-		// IMPORT_MODE says, so a hardlink probe there answers a question the
-		// vault has stopped asking.
-		if t.name == "library" && s.cfg.VaultArchiveEnabled {
-			continue
-		}
 		c := importCheck{Target: t.name, Source: s.cfg.QBSavePath, Destination: t.dest, OK: true}
 		if err := fileops.CheckHardlink(s.cfg.QBSavePath, t.dest); err != nil {
 			c.OK, c.Error = false, err.Error()

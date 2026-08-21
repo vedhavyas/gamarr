@@ -2,7 +2,6 @@ package fileops
 
 import (
 	"archive/tar"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -119,6 +118,15 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 		writeFile(t, filepath.Join(src, name), content)
 	}
 
+	// Repacks ship empty directories the installer writes into. The census
+	// counts only regular files, so nothing else would notice these going
+	// missing.
+	for _, dir := range []string{"MD5", "Saves"} {
+		if err := os.MkdirAll(filepath.Join(src, dir), 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
 	vault := filepath.Join(root, "vault")
 	dest := ArchiveDest(filepath.Join(vault, "007 First Light"))
 	if err := Archive(src, dest); err != nil {
@@ -131,9 +139,16 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 			t.Errorf("tar entry %q = %q, want %q", name, got[name], content)
 		}
 	}
-	delete(got, "MD5/")
+	// Assert the directory entries are present before dropping them from the
+	// count, or the comparison passes whether or not they were written.
+	for _, dir := range []string{"MD5/", "Saves/"} {
+		if _, ok := got[dir]; !ok {
+			t.Errorf("tar is missing the directory entry %q", dir)
+		}
+		delete(got, dir)
+	}
 	if len(got) != len(want) {
-		t.Errorf("tar holds %d entries, want %d: %v", len(got), len(want), got)
+		t.Errorf("tar holds %d file entries, want %d: %v", len(got), len(want), got)
 	}
 
 	if names := vaultEntries(t, vault); len(names) != 1 || names[0] != "007 First Light.tar" {
@@ -218,26 +233,43 @@ func TestArchiveRefusesAnEmptyResult(t *testing.T) {
 }
 
 // A rename overwrites atomically and totally, unlike the directory merge the
-// archive path replaced, so a second import must not silently replace a
-// complete game.
-func TestArchiveRefusesAnExistingDestination(t *testing.T) {
-	root := t.TempDir()
-	src := filepath.Join(root, "Game")
-	writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+// archive path replaced. Both layouts count as occupied: a folder left by an
+// unarchived import is the same game, and refusing only the archive stores it
+// twice at full size.
+func TestArchiveRefusesAnOccupiedVault(t *testing.T) {
+	t.Run("an existing archive", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "Game")
+		writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
 
-	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
-	if err := Archive(src, dest); err != nil {
-		t.Fatalf("first Archive: %v", err)
-	}
-	before := read(t, dest)
+		dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+		if err := Archive(src, dest); err != nil {
+			t.Fatalf("first Archive: %v", err)
+		}
+		before := read(t, dest)
 
-	err := Archive(src, dest)
-	if !errors.Is(err, ErrArchiveExists) {
-		t.Errorf("second Archive = %v, want ErrArchiveExists", err)
-	}
-	if read(t, dest) != before {
-		t.Error("the existing archive was modified")
-	}
+		if err := Archive(src, dest); err == nil {
+			t.Error("second Archive = nil, want a refusal")
+		}
+		if read(t, dest) != before {
+			t.Error("the existing archive was modified")
+		}
+	})
+
+	t.Run("a folder from an unarchived import", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "Game")
+		writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+		writeFile(t, filepath.Join(root, "vault", "Game", "setup.exe"), "OLD")
+
+		dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+		if err := Archive(src, dest); err == nil {
+			t.Error("Archive = nil, want a refusal: the vault already holds the folder")
+		}
+		if _, err := os.Lstat(dest); err == nil {
+			t.Error("stored the same game a second time, as an archive beside the folder")
+		}
+	})
 }
 
 // Two flows can resolve to one vault name: a torrent and an NZB of the same
@@ -282,6 +314,53 @@ func TestArchiveConcurrentSameDestination(t *testing.T) {
 	}
 	if names := vaultEntries(t, filepath.Dir(dest)); len(names) != 1 {
 		t.Errorf("vault holds %v, want just the archive", names)
+	}
+}
+
+// GameVault reads the vault from a separate container over a shared mount, so a
+// mode only the writing uid can read publishes a game nothing can open. Every
+// other import path preserves the source's mode; this one invents one, and
+// os.CreateTemp's 0600 is not subject to umask.
+func TestArchiveIsReadableByOtherUsers(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, dest); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	fi, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat archive: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0644 {
+		t.Errorf("published archive mode = %v, want 0644", got)
+	}
+}
+
+// The count comparison is the whole of the verification, and deleting the
+// expression leaves everything else green: the zero case has its own guard, so
+// only a census that disagrees with the walk reaches it.
+func TestArchiveRefusesWhenTheCountsDisagree(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+
+	real := censusOf
+	censusOf = func(string) (int64, int64, error) { return 7, 99999, nil }
+	t.Cleanup(func() { censusOf = real })
+
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, dest); err == nil {
+		t.Fatal("Archive = nil, want an error when the archive does not match the source")
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		t.Error("published an archive that did not match the source")
+	}
+	if names := vaultEntries(t, filepath.Dir(dest)); len(names) != 0 {
+		t.Errorf("vault holds %v, want nothing", names)
 	}
 }
 
