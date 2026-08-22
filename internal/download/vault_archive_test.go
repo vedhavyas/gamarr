@@ -2,6 +2,7 @@ package download
 
 import (
 	"archive/tar"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -57,6 +58,7 @@ func irregularTree(t *testing.T, dir string) {
 func TestOrganizeGameArchivesVaultFolder(t *testing.T) {
 	cfg := newTestConfig(t)
 	cfg.VaultArchiveEnabled = true
+	cfg.ImportMode = fileops.ModeCopy
 	jobs := newTestJobs(t)
 
 	content := filepath.Join(t.TempDir(), "007 First Light (2025)")
@@ -83,8 +85,8 @@ func TestOrganizeGameArchivesVaultFolder(t *testing.T) {
 		t.Error("archive was not tracked in the library")
 	}
 
-	// An archive is a copy, so the seeded data must survive and the torrent must
-	// not be deleted with its files.
+	// Writing the archive never touches the source, and under a preserving mode
+	// nothing downstream takes it either.
 	if !pathExists(filepath.Join(content, "fg-01.bin")) {
 		t.Error("archiving destroyed the source")
 	}
@@ -189,6 +191,133 @@ func TestOrganizeGameCompletesWhenTheArchiveIsAlreadyThere(t *testing.T) {
 		if call.deleteFiles {
 			t.Errorf("torrent %s was deleted with its data", call.hash)
 		}
+	}
+}
+
+// The bug this fixes: an archive import reported a copy whatever IMPORT_MODE
+// said, so a user who asked for move kept the torrent and its files forever. An
+// archive holds the whole download, so move means move.
+func TestArchiveImportHonoursMoveMode(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	cfg.ImportMode = fileops.ModeMove
+
+	content := filepath.Join(t.TempDir(), "Moved Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	writeFileT(t, filepath.Join(content, "fg-01.bin"), []byte(strings.Repeat("payload", 512)))
+
+	qm := newQbitMock(t)
+	m := New(cfg, newTestJobs(t), qm.client())
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Moved Game", Hash: "mv1", ContentPath: content}, "PC", "", true)
+
+	if got := tarEntries(t, filepath.Join(cfg.GamesVaultPath, "Moved Game.tar")); got["setup.exe"] != "installer" {
+		t.Fatalf("archive contents = %v, want the source files", got)
+	}
+	calls := qm.deleteCalls()
+	if len(calls) != 1 {
+		t.Fatalf("delete calls = %+v, want exactly one", calls)
+	}
+	if calls[0].hash != "mv1" || !calls[0].deleteFiles {
+		t.Errorf("delete call = %+v, want mv1 with deleteFiles=true", calls[0])
+	}
+}
+
+// An archive is written rather than linked, so the job feed has to say copied
+// whatever preserving mode is configured. Reporting "Hardlinked" for a tar with
+// nothing linked anywhere is the claim importDetail exists to prevent.
+func TestArchiveImportReportsACopyUnderPreservingModes(t *testing.T) {
+	for _, mode := range []fileops.Mode{fileops.ModeHardlink, fileops.ModeSymlink, fileops.ModeCopy} {
+		t.Run(string(mode), func(t *testing.T) {
+			cfg := newTestConfig(t)
+			cfg.VaultArchiveEnabled = true
+			cfg.ImportMode = mode
+			m := New(cfg, newTestJobs(t), newQbitMock(t).client())
+
+			content := filepath.Join(t.TempDir(), "Verb Game")
+			writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+			jobID := newJobID()
+			m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+			m.organizeGame(jobID, &qbit.Torrent{Name: "Verb Game", Hash: "vb1", ContentPath: content}, "PC", "", true)
+
+			job, _ := m.Jobs().Get(jobID)
+			if detail, _ := job["detail"].(string); detail != "Copied to GameVault" {
+				t.Errorf("detail = %q, want %q", detail, "Copied to GameVault")
+			}
+		})
+	}
+}
+
+// The archive is the only thing that authorises dropping the download, so a
+// verify that fails has to keep it even under move.
+func TestArchiveImportKeepsTheDownloadWhenVerifyFails(t *testing.T) {
+	verifyArchive = func(string, string) error { return errors.New("cannot read the published archive") }
+	t.Cleanup(func() { verifyArchive = fileops.VerifyArchive })
+
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	cfg.ImportMode = fileops.ModeMove
+	qm := newQbitMock(t)
+	m := New(cfg, newTestJobs(t), qm.client())
+
+	content := filepath.Join(t.TempDir(), "Unverified Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Unverified Game", Hash: "uv1", ContentPath: content}, "PC", "", true)
+
+	for _, call := range qm.deleteCalls() {
+		if call.deleteFiles {
+			t.Errorf("torrent %s was deleted with its data on an archive that failed verification", call.hash)
+		}
+	}
+	if !pathExists(filepath.Join(content, "setup.exe")) {
+		t.Error("the download was dropped on an archive that failed verification")
+	}
+}
+
+// The state a library is in after its first run: the vault already holds an
+// archive, so a re-grab lands on the accept rather than on a fresh write. The
+// occupant is only known to be large enough to be this game, which cannot tell
+// this build from another, so a newer download must not be dropped against an
+// older build sitting at the same name.
+func TestArchiveAlreadyInVaultKeepsTheDownload(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	cfg.ImportMode = fileops.ModeMove
+
+	content := filepath.Join(t.TempDir(), "Stored Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	writeFileT(t, filepath.Join(content, "fg-01.bin"), []byte(strings.Repeat("payload", 512)))
+
+	// A real archive of this content, so the accept rests on the census rather
+	// than on something merely sitting at the name.
+	staged := filepath.Join(t.TempDir(), "staged.tar")
+	if err := fileops.Archive(content, staged); err != nil {
+		t.Fatalf("build fixture archive: %v", err)
+	}
+	if err := os.Rename(staged, filepath.Join(cfg.GamesVaultPath, "Stored Game.tar")); err != nil {
+		t.Fatalf("place fixture archive: %v", err)
+	}
+
+	qm := newQbitMock(t)
+	m := New(cfg, newTestJobs(t), qm.client())
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Stored Game", Hash: "st1", ContentPath: content}, "PC", "", true)
+
+	for _, call := range qm.deleteCalls() {
+		if call.deleteFiles {
+			t.Errorf("torrent %s was deleted with its data against an archive this import did not write", call.hash)
+		}
+	}
+	if !pathExists(filepath.Join(content, "fg-01.bin")) {
+		t.Error("the download was dropped against an archive this import did not write")
 	}
 }
 

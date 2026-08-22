@@ -64,6 +64,38 @@ func ArchiveHolds(path, src string) bool {
 	return err == nil && fi.Size() >= wantBytes
 }
 
+// VerifyArchive reports whether the archive at dest can stand in for src: a
+// readable tar holding at least the bytes src's files add up to.
+//
+// This is what authorises dropping src. It re-reads the published file rather
+// than trusting a successful write, so a truncated or unreadable archive cannot
+// take the source with it.
+func VerifyArchive(dest, src string) error {
+	fi, err := os.Lstat(dest)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", dest)
+	}
+	_, wantBytes, err := censusOf(src)
+	if err != nil {
+		return err
+	}
+	if fi.Size() < wantBytes {
+		return fmt.Errorf("archive %s holds %d bytes, source has %d", dest, fi.Size(), wantBytes)
+	}
+	f, err := os.Open(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := tar.NewReader(f).Next(); err != nil {
+		return fmt.Errorf("archive %s is not readable: %w", dest, err)
+	}
+	return nil
+}
+
 // partialPattern is the os.CreateTemp pattern for an in-progress archive. The
 // leading dot is load-bearing: it keeps a partial out of Gamarr's own vault
 // scan, which skips dotfiles, and out of a GameVault library scan.
@@ -104,12 +136,10 @@ func Archivable(src string) bool {
 // compressed, so a second pass costs hours of CPU for no size change.
 //
 // A nil return means every regular file under src reached the archive and the
-// archive is published at dest, on a name nothing else held. It does not mean
-// the bytes are safe on whatever backs the vault: the sync below reaches the
-// vault's own storage, which on an rclone mount is a local cache file, and the
-// upload to the remote happens afterwards and asynchronously, with failures
-// retried and logged somewhere Gamarr cannot read. Nothing may treat this
-// return as authority to delete the source.
+// archive is published at dest, on a name nothing else held. Dropping src takes
+// VerifyArchive on top of that: what a write reported and what the destination
+// now holds are separate questions. Durability past that point belongs to
+// whatever storage backs the vault.
 func Archive(src, dest string) error {
 	defer lockDest(dest)()
 
