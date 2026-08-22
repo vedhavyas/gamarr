@@ -424,9 +424,10 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 // landed at along with the mode that got it there.
 //
 // Under VAULT_ARCHIVE_ENABLED a directory is written as a single tar instead of
-// being imported as a folder. Writing a new archive cannot move or hardlink the
-// source, so an archive import is a copy: the download survives it whatever
-// IMPORT_MODE says, and the torrent is left seedable.
+// being imported as a folder. Writing the archive is itself always a copy, so a
+// source-preserving mode reports one and the torrent is left seedable; under
+// move the download is dropped, but only once the published archive is
+// confirmed to stand in for it.
 func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
 	base := filepath.Join(m.cfg.GamesVaultPath, sanitizeFilename(filepath.Base(src)))
 
@@ -435,6 +436,10 @@ func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
 	// while the plain path stored the same game a second time beside it.
 	if occ, done, occupied := acceptOccupiedVault(base, src); occupied {
 		if done {
+			// Copy however the import is configured. The occupant is only known
+			// to be big enough to be an archive of src, which cannot tell this
+			// build from another of the same game, so honouring move here would
+			// drop a newer download and keep the older build in the library.
 			return occ, fileops.ModeCopy, nil
 		}
 		return occ, fileops.ModeCopy, fmt.Errorf("%w: %s", fileops.ErrDestinationOccupied, occ)
@@ -447,10 +452,38 @@ func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
 				"src", sanitizeLog(src), "dest", sanitizeLog(dest), "error", err)
 			return dest, fileops.ModeCopy, err
 		}
-		return dest, fileops.ModeCopy, nil
+		return dest, m.archivedImportMode(dest, src), nil
 	}
 	mode, err := m.importContent(src, base)
 	return base, mode, err
+}
+
+// verifyArchive indirects fileops.VerifyArchive so a test can fail the check
+// that authorises dropping a download. It is otherwise unreachable, since the
+// only caller runs it on an archive Archive has just written successfully.
+var verifyArchive = fileops.VerifyArchive
+
+// archivedImportMode reports the mode an archive this import just wrote counts
+// as. Only for an archive written from src: one that was already there cannot be
+// told apart from an archive of another build.
+//
+// A mode that drops the source needs the published archive confirmed to stand
+// in for it first. Failing that the import counts as a copy and the download
+// stays, which costs disk rather than content.
+func (m *Manager) archivedImportMode(dest, src string) fileops.Mode {
+	mode := m.importOptions().Mode
+	if mode.PreservesSource() {
+		// The archive was written, not linked, so a copy is what happened. Every
+		// preserving mode takes the same finishTorrent branch, so this changes
+		// only the verb the UI reports, and it makes it true.
+		return fileops.ModeCopy
+	}
+	if err := verifyArchive(dest, src); err != nil {
+		slog.Error("keeping the download: the vault archive cannot be confirmed to stand in for it",
+			"dest", sanitizeLog(dest), "error", err)
+		return fileops.ModeCopy
+	}
+	return mode
 }
 
 // acceptOccupiedVault decides what an already-occupied vault destination means
