@@ -445,7 +445,7 @@ func (m *Manager) importToVault(src string) (string, fileops.Mode, error) {
 		return occ, fileops.ModeCopy, fmt.Errorf("%w: %s", fileops.ErrDestinationOccupied, occ)
 	}
 
-	if m.cfg.VaultArchiveEnabled && fileops.Archivable(src) {
+	if m.vaultArchiveEnabled() && fileops.Archivable(src) {
 		dest := fileops.ArchiveDest(base)
 		if err := fileops.Archive(src, dest); err != nil {
 			slog.Error("vault archive failed, download left in place",
@@ -1254,9 +1254,11 @@ func pathExists(p string) bool {
 // imports will actually use.
 func (m *Manager) LoadSettings() *Settings {
 	defaults := func() *Settings {
+		archive := m.cfg.VaultArchiveEnabled
 		return &Settings{
-			ExtractArchives: m.cfg.ExtractArchives,
-			ImportMode:      string(m.effectiveImportMode()),
+			ExtractArchives:     m.cfg.ExtractArchives,
+			ImportMode:          string(m.effectiveImportMode()),
+			VaultArchiveEnabled: &archive,
 		}
 	}
 	settingsFile := filepath.Join(m.cfg.DataDir, "settings.json")
@@ -1273,7 +1275,21 @@ func (m *Manager) LoadSettings() *Settings {
 	} else {
 		s.ImportMode = string(mode)
 	}
+	if s.VaultArchiveEnabled == nil {
+		archive := m.cfg.VaultArchiveEnabled
+		s.VaultArchiveEnabled = &archive
+	}
 	return &s
+}
+
+// vaultArchiveEnabled reports whether a PC game is written to the vault as one
+// archive. The runtime setting wins so it can be changed from the UI without a
+// restart; the environment default applies when it is unset.
+func (m *Manager) vaultArchiveEnabled() bool {
+	if s := m.LoadSettings(); s != nil && s.VaultArchiveEnabled != nil {
+		return *s.VaultArchiveEnabled
+	}
+	return m.cfg.VaultArchiveEnabled
 }
 
 // effectiveImportMode is the configured default, guarding against a zero
@@ -1298,6 +1314,11 @@ type Settings struct {
 	// ImportMode overrides IMPORT_MODE at runtime. Empty means "follow the
 	// environment default".
 	ImportMode string `json:"import_mode"`
+	// VaultArchiveEnabled overrides VAULT_ARCHIVE_ENABLED at runtime. A pointer
+	// so an absent value is not the same as a stored false, which is what keeps
+	// a settings file written before this option existed from turning archiving
+	// off for an install that set the environment variable.
+	VaultArchiveEnabled *bool `json:"vault_archive_enabled"`
 }
 
 // DDL source management
