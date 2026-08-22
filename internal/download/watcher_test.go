@@ -437,8 +437,15 @@ func TestWatcherStopsOnAPermanentPathError(t *testing.T) {
 	if status, _ := job["status"].(string); status != "error" {
 		t.Errorf("status = %q, want error", status)
 	}
-	if detail, _ := job["detail"].(string); strings.Contains(detail, "Gave up after") {
+	// Assert what should be there as well as what should not: an empty detail
+	// satisfies the negative on its own, so a give-up write that blanked the
+	// terminal state would slip through it.
+	detail, _ := job["detail"].(string)
+	if strings.Contains(detail, "Gave up after") {
 		t.Errorf("detail = %q; a permanent failure already wrote its own terminal state", detail)
+	}
+	if detail == "" {
+		t.Error("detail was blanked, so whatever the import wrote about this failure is gone")
 	}
 	if msg, _ := job["error"].(string); !strings.Contains(msg, "not a directory") {
 		t.Errorf("error = %q, want the real errno rather than a generic miss", msg)
