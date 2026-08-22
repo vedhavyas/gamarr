@@ -209,7 +209,9 @@ func (m *Manager) OrganizeTorrent(hash, platf, platSlug string, isPC bool) (stri
 		"detail":        "Scanning and organizing...",
 	})
 
-	go m.organizeWithScan(jobID, torrent, platf, platSlug, isPC)
+	// By value: the retry reassigns its torrent as the client republishes it, and
+	// torrent points into the slice this read back from the client.
+	go m.importFinishedTorrent("manual organize", jobID, *torrent, platf, platSlug, isPC)
 	return jobID, nil
 }
 
@@ -259,42 +261,7 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 
 			// Wait for completion
 			if t.Progress >= 1.0 || t.State == "stoppedUP" {
-				contentPath := t.ContentPath
-				savePath := t.SavePath
-				if savePath == "" {
-					savePath = m.cfg.QBSavePath
-				}
-				scanPath := contentPath
-				if scanPath == "" {
-					scanPath = filepath.Join(savePath, tName)
-				}
-
-				// Layer 2: ClamAV scan
-				m.jobs.UpdateMulti(jobID, map[string]interface{}{
-					"status": "scanning",
-					"detail": "Running virus scan...",
-				})
-				isClean, infected := safety.ScanWithClamAV(scanPath, m.cfg.ClamAVContainer, m.cfg.ClamAVSocket, m.cfg.DockerSocket)
-				if !isClean {
-					slog.Warn("ClamAV found infections", "title", title, "infected", infected)
-					detail := infected
-					if len(detail) > 3 {
-						detail = detail[:3]
-					}
-					m.jobs.UpdateMulti(jobID, map[string]interface{}{
-						"status": "error",
-						"error":  fmt.Sprintf("Virus detected: %s", strings.Join(detail, "; ")),
-						"detail": "Infected files found - download quarantined",
-					})
-					m.qb.DeleteTorrent(t.Hash, true)
-					return
-				}
-
-				m.jobs.UpdateMulti(jobID, map[string]interface{}{
-					"status": "organizing",
-					"detail": "Scans passed. Moving to library...",
-				})
-				m.organizeGame(jobID, &t, platf, platSlug, isPC)
+				m.importFinishedTorrent("job watch", jobID, t, platf, platSlug, isPC)
 				return
 			}
 		}
@@ -568,6 +535,94 @@ func importDetail(mode fileops.Mode, target string) string {
 		verb = "Copied to"
 	}
 	return fmt.Sprintf("%s %s", verb, target)
+}
+
+// importFinishedTorrent scans and imports a finished torrent, retrying while its
+// content path is simply not there yet, and reports whether the job completed.
+//
+// A client publishes a finished download by renaming it into place, so a path
+// missing the instant progress reads complete is a race rather than a verdict.
+// Every caller that imports comes through here: a caller that discarded the
+// retryable signal would error the job permanently, and an errored job then
+// stops the watcher rescuing it.
+func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf, platSlug string, isPC bool) bool {
+	attempt := 0
+	// Empty means the import wrote its own terminal state and nothing here may
+	// overwrite it: a quarantined download has already had its files deleted, and
+	// telling the user to go organize it by hand would be wrong.
+	var giveUp string
+	for {
+		attempt++
+		retryable := m.organizeWithScan(jobID, &t, platf, platSlug, isPC)
+
+		if job, ok := m.jobs.Get(jobID); ok {
+			if status, _ := job["status"].(string); status == "completed" {
+				slog.Info("import completed", "via", via, "name", sanitizeLog(t.Name), "attempts", attempt)
+				return true
+			}
+		}
+
+		if !retryable {
+			break
+		}
+		if attempt >= importAttempts {
+			giveUp = fmt.Sprintf("Gave up after %d attempts. The download is still in the client, "+
+				"so organize it by hand once the files are in place.", attempt)
+			break
+		}
+
+		// organizing is a status the job store rewrites to interrupted on startup.
+		// Left at error, a restart during the wait leaves a row reading as retrying
+		// with nothing retrying it.
+		m.jobs.UpdateMulti(jobID, map[string]interface{}{
+			"status": "organizing",
+			"detail": fmt.Sprintf("Waiting for the download client to publish the finished files, attempt %d of %d", attempt, importAttempts),
+			// The failed attempt left its error behind and the UI renders that
+			// field whatever the status is, so a later success would show a
+			// completed import under a mount-misconfiguration error.
+			"error": nil,
+		})
+		time.Sleep(importRetryDelay)
+
+		// Ask the client again rather than reusing the value that just failed:
+		// content_path changes when the client publishes the finished download.
+		fresh, found, err := m.torrentByHash(t.Hash)
+		switch {
+		case err != nil:
+			slog.Warn("could not re-read the torrent, trying again",
+				"via", via, "name", sanitizeLog(t.Name), "error", err)
+		case !found:
+			giveUp = "The download client no longer lists this torrent, so there is nothing left to import."
+		default:
+			t = fresh
+		}
+		if giveUp != "" {
+			break
+		}
+	}
+
+	if giveUp != "" {
+		m.jobs.UpdateMulti(jobID, map[string]interface{}{"status": "error", "detail": giveUp})
+	}
+	slog.Warn("import did not complete", "via", via, "name", sanitizeLog(t.Name), "attempts", attempt)
+	return false
+}
+
+// torrentByHash re-reads a torrent from the client by exact hash. The bool means
+// anything only when the error is nil: a read that failed is not evidence the
+// client stopped holding the torrent, and acting on it as though it were turns
+// one bad request into a permanent give-up.
+func (m *Manager) torrentByHash(hash string) (qbit.Torrent, bool, error) {
+	torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
+	if err != nil {
+		return qbit.Torrent{}, false, err
+	}
+	for _, t := range torrents {
+		if strings.EqualFold(t.Hash, hash) {
+			return t, true, nil
+		}
+	}
+	return qbit.Torrent{}, false, nil
 }
 
 // organizeWithScan scans a finished torrent and imports it, reporting the same
