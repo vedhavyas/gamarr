@@ -114,7 +114,7 @@ func (p *Pipeline) organizeROM(sourcePath, platformSlug string) (string, error) 
 	}
 
 	if err := p.importContent(sourcePath, dest); err != nil {
-		return dest, err
+		return sourcePath, err
 	}
 
 	slog.Info("ROM organized", "source", sourcePath, "dest", dest, "platform", platformSlug)

@@ -338,6 +338,69 @@ func TestOrganizeNZBKeepsStagingWhenArchiveFails(t *testing.T) {
 	}
 }
 
+// The usenet path takes the same occupancy decision as the torrent path. Without
+// it, fileops.Archive refuses instead, which turns a lost job update into a
+// permanent failure rather than a finished import.
+func TestOrganizeNZBCompletesWhenTheArchiveIsAlreadyThere(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	m := New(cfg, newTestJobs(t), nil)
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	storage := filepath.Join(t.TempDir(), "PC Game")
+	writeFileT(t, filepath.Join(storage, "setup.exe"), []byte("installer"))
+	writeFileT(t, filepath.Join(storage, "fg-01.bin"), []byte(strings.Repeat("payload", 512)))
+
+	staged := filepath.Join(t.TempDir(), "staged.tar")
+	if err := fileops.Archive(storage, staged); err != nil {
+		t.Fatalf("build fixture archive: %v", err)
+	}
+	published := filepath.Join(cfg.GamesVaultPath, "PC Game.tar")
+	if err := os.Rename(staged, published); err != nil {
+		t.Fatalf("place fixture archive: %v", err)
+	}
+
+	m.organizeNZBDownload(jobID, storage, "PC Game", "PC", "", true)
+
+	job, _ := m.Jobs().Get(jobID)
+	if status, _ := job["status"].(string); status != "completed" {
+		t.Errorf("status = %q, want completed (job=%v)", status, job)
+	}
+	if !m.Jobs().LibraryHasSourceID("nzb:" + published) {
+		t.Error("the already-published archive was not tracked in the library")
+	}
+}
+
+// The reject half of that same decision. An occupant that cannot be an archive
+// of this download must not be reported as this download: a completed job plus a
+// library row is exactly what a release decision is read from.
+func TestOrganizeNZBRefusesAnOccupantThatIsNotTheArchive(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	m := New(cfg, newTestJobs(t), nil)
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	storage := filepath.Join(t.TempDir(), "PC Game")
+	writeFileT(t, filepath.Join(storage, "setup.exe"), []byte(strings.Repeat("installer", 4096)))
+	occupant := filepath.Join(cfg.GamesVaultPath, "PC Game.tar")
+	writeFileT(t, occupant, []byte("tiny"))
+
+	m.organizeNZBDownload(jobID, storage, "PC Game", "PC", "", true)
+
+	job, _ := m.Jobs().Get(jobID)
+	if status, _ := job["status"].(string); status != "error" {
+		t.Errorf("status = %q, want error (job=%v)", status, job)
+	}
+	if m.Jobs().LibraryHasSourceID("nzb:" + occupant) {
+		t.Error("filed a library row for content that was never stored")
+	}
+	if !pathExists(filepath.Join(storage, "setup.exe")) {
+		t.Error("the download was not left in place")
+	}
+}
+
 // The ROM library needs the raw file: RomM cannot read a tar and GameVault
 // never sees that tree, so the option must not reach it.
 func TestOrganizeNZBNeverArchivesROMs(t *testing.T) {
@@ -378,6 +441,11 @@ func TestOrganizeNZBCompletesFromExistingArchive(t *testing.T) {
 	job, _ := m.Jobs().Get(jobID)
 	if status, _ := job["status"].(string); status != "completed" {
 		t.Errorf("status = %q, want completed (job=%v)", status, job)
+	}
+	// An archive import is a copy on the recovery route too. Staging is gone
+	// here, so the name is the only thing the mode can be derived from.
+	if detail, _ := job["detail"].(string); detail != "Copied to GameVault" {
+		t.Errorf("detail = %q, want %q", detail, "Copied to GameVault")
 	}
 	if !m.Jobs().LibraryHasSourceID("nzb:" + dest) {
 		t.Error("existing archive was not tracked in the library")
