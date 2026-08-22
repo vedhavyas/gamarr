@@ -5,6 +5,7 @@ package download
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -179,7 +180,10 @@ func (m *Manager) DownloadDDL(url, vimmID, title, platf, platSlug string, isPC b
 
 // OrganizeTorrent manually triggers organize for a completed torrent.
 func (m *Manager) OrganizeTorrent(hash, platf, platSlug string, isPC bool) (string, error) {
-	torrents := m.qb.GetTorrents(m.cfg.QBCategory)
+	torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
+	if err != nil {
+		return "", fmt.Errorf("cannot read the download client: %w", err)
+	}
 	var torrent *qbit.Torrent
 	for i := range torrents {
 		if torrents[i].Hash == hash {
@@ -216,7 +220,12 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 	fileScanDone := false
 
 	for time.Since(start) < maxWait {
-		torrents := m.qb.GetTorrents(m.cfg.QBCategory)
+		torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
+		if err != nil {
+			slog.Warn("could not read the download client", "title", title, "error", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
 		for _, t := range torrents {
 			tName := t.Name
 			if !jobMatchesTorrent(infoHash, title, t.Hash, tName) {
@@ -297,12 +306,19 @@ func (m *Manager) watchGameTorrent(jobID, infoHash, title, platf, platSlug strin
 	})
 }
 
-func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platSlug string, isPC bool) {
+// organizeGame imports a finished torrent, reporting whether a failure is worth
+// another attempt later. Only a content path that is not there yet is: the
+// client may still be moving files into place when the download reads complete.
+func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platSlug string, isPC bool) (retryable bool) {
 	contentPath := torrent.ContentPath
 	torrentName := torrent.Name
 	torrentHash := torrent.Hash
 
-	if contentPath == "" || !pathExists(contentPath) {
+	// content_path is the client's own answer and the only authoritative one.
+	// Joining the save path to the torrent's DISPLAY name is a guess, and it
+	// resolves for nothing whose internal folder differs from its title, which
+	// is every FitGirl release. Guess only when the client gave nothing.
+	if contentPath == "" {
 		savePath := torrent.SavePath
 		if savePath == "" {
 			savePath = m.cfg.QBSavePath
@@ -310,19 +326,25 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 		contentPath = filepath.Join(savePath, torrentName)
 	}
 
-	if !pathExists(contentPath) {
+	if _, statErr := os.Stat(contentPath); statErr != nil {
+		// Only a path that is not there yet comes good on its own. A permission
+		// error, or a file where a directory belongs, reads the same way on
+		// every attempt, and its errno is the only thing naming the cause, so
+		// neither gets retried nor discarded.
+		//
 		// The path comes from the download client. Gamarr has no remote path
 		// mapping, so the client's paths have to resolve identically inside
 		// this container — the usual cause of a path that exists for the
 		// client and not for Gamarr.
+		missing := errors.Is(statErr, os.ErrNotExist)
 		m.jobs.UpdateMulti(jobID, map[string]interface{}{
 			"status": "error",
-			"error": fmt.Sprintf("Cannot find downloaded files at %s — this is the path "+
+			"error": fmt.Sprintf("Cannot read the downloaded files at %s: %v — this is the path "+
 				"the download client reported; Gamarr must see it at the same path, so "+
-				"check the two are mounted the same way", contentPath),
+				"check the two are mounted the same way", contentPath, statErr),
 		})
-		slog.Error("content path not found", "path", contentPath)
-		return
+		slog.Error("content path not readable", "path", contentPath, "error", statErr, "retryable", missing)
+		return missing
 	}
 
 	// Platform detection from metadata
@@ -376,7 +398,7 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 			m.jobs.UpdateMulti(jobID, map[string]interface{}{
 				"status": "error", "error": fmt.Sprintf("Organize failed: %v", err),
 			})
-			return
+			return false
 		}
 		m.jobs.UpdateMulti(jobID, map[string]interface{}{
 			"status": "completed", "detail": importDetail(mode, "GameVault"),
@@ -397,7 +419,7 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 			m.jobs.UpdateMulti(jobID, map[string]interface{}{
 				"status": "error", "error": fmt.Sprintf("Organize failed: %v", err),
 			})
-			return
+			return false
 		}
 		m.jobs.UpdateMulti(jobID, map[string]interface{}{
 			"status": "completed", "detail": importDetail(mode, fmt.Sprintf("RomM (%s)", platf)),
@@ -414,10 +436,11 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 			"status": "completed", "detail": "Downloaded (unknown platform, left in staging)",
 		})
 		slog.Warn("no platform slug, left in downloads", "name", torrentName)
-		return // Don't delete torrent
+		return false // Don't delete torrent
 	}
 
 	m.finishTorrent(torrentHash, torrentName, importMode)
+	return false
 }
 
 // importToVault places finished PC content in the vault and reports the path it
@@ -547,7 +570,9 @@ func importDetail(mode fileops.Mode, target string) string {
 	return fmt.Sprintf("%s %s", verb, target)
 }
 
-func (m *Manager) organizeWithScan(jobID string, torrent *qbit.Torrent, platf, platSlug string, isPC bool) {
+// organizeWithScan scans a finished torrent and imports it, reporting the same
+// retryable signal organizeGame does.
+func (m *Manager) organizeWithScan(jobID string, torrent *qbit.Torrent, platf, platSlug string, isPC bool) (retryable bool) {
 	contentPath := torrent.ContentPath
 	savePath := torrent.SavePath
 	if savePath == "" {
@@ -575,12 +600,12 @@ func (m *Manager) organizeWithScan(jobID string, torrent *qbit.Torrent, platf, p
 			"detail": "Infected files found - download quarantined",
 		})
 		m.qb.DeleteTorrent(torrent.Hash, true)
-		return
+		return false
 	}
 	m.jobs.UpdateMulti(jobID, map[string]interface{}{
 		"status": "organizing", "detail": "Scans passed. Moving to library...",
 	})
-	m.organizeGame(jobID, torrent, platf, platSlug, isPC)
+	return m.organizeGame(jobID, torrent, platf, platSlug, isPC)
 }
 
 func (m *Manager) ddlDownloadWorker(jobID, dlURL, vimmID, title, platf, platSlug string, isPC bool) {
@@ -1049,7 +1074,11 @@ func (m *Manager) RecoverOrphanedTorrents() {
 		}
 	}
 
-	torrents := m.qb.GetTorrents(m.cfg.QBCategory)
+	torrents, err := m.qb.GetTorrents(m.cfg.QBCategory)
+	if err != nil {
+		slog.Warn("orphan recovery: could not read the download client", "error", err)
+		return
+	}
 	pcReleaseGroups := map[string]bool{
 		"skidrow": true, "codex": true, "fitgirl": true, "dodi": true,
 		"gog": true, "plaza": true, "cpy": true, "empress": true,
