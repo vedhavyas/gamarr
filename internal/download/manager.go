@@ -347,11 +347,27 @@ func (m *Manager) organizeGame(jobID string, torrent *qbit.Torrent, platf, platS
 		}
 	}
 
-	// This if/else is the entire ROM guarantee. is_pc arrives unvalidated on
-	// several request bodies and is never cross-checked against platform_slug,
-	// so a caller can route a ROM here; nothing but this single branch keeps ROM
-	// content out of the vault. Do not restructure it into a form that can reach
-	// both arms.
+	// A PC classification can arrive from an ambiguous category rather than a
+	// real PC release: Newznab 4050 is PC/Games, but it is also where Prowlarr
+	// files Nyaa's Software - Games, which is how Switch ROMs get in. The two
+	// detections above are skipped once isPC is set, so without this a Nyaa
+	// Switch ROM imports into GameVault instead of the Switch ROM library.
+	if isPC {
+		if info, ok := platform.DetectConsoleROM(contentPath); ok {
+			platf, platSlug, isPC = info.Name, info.Slug, info.IsPC
+			m.jobs.UpdateMulti(jobID, map[string]interface{}{
+				"platform": platf, "platform_slug": platSlug, "is_pc": isPC,
+			})
+			slog.Info("reclassified PC-tagged download from its ROM files", "platform", platf)
+		}
+	}
+
+	// DetectConsoleROM above is the first guard on this boundary and is narrow
+	// by design, so everything it does not cover arrives here and this if/else
+	// is the rest of the guarantee: is_pc comes in unvalidated on several
+	// request bodies and is never cross-checked against platform_slug, so a
+	// caller can still route a ROM to the vault. Do not restructure it into a
+	// form that can reach both arms.
 	var importMode fileops.Mode
 	if isPC {
 		dest, mode, err := m.importToVault(contentPath)
