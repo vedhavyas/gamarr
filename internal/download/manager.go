@@ -567,7 +567,7 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 		}
 		if attempt >= importAttempts {
 			giveUp = fmt.Sprintf("Gave up after %d attempts. The download is still in the client, "+
-				"so organize it by hand once the files are in place.", attempt)
+				"so use Retry once the files are in place.", attempt)
 			break
 		}
 
