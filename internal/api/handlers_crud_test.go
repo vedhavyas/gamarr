@@ -272,15 +272,22 @@ func TestRetryJob(t *testing.T) {
 	env := newTestEnv(t, nil)
 	env.jobs.Set("job-err", map[string]interface{}{"status": "error", "title": "Broken"})
 
-	t.Run("failed job requeued", func(t *testing.T) {
+	// A job with no torrent recorded has nothing to import again, and the row
+	// stays where the UI still offers a button. It used to report success and
+	// park at "queued", which nothing consumed and nothing could act on.
+	t.Run("job with no torrent reports failure", func(t *testing.T) {
 		rr := env.do("POST", "/api/downloads/job-err/retry", "")
 		wantStatus(t, rr, 200)
-		if m := decodeMap(t, rr); m["success"] != true {
-			t.Errorf("retry failed: %v", m)
+		m := decodeMap(t, rr)
+		if m["success"] != false {
+			t.Errorf("retry reported success with no torrent to import: %v", m)
+		}
+		if msg, _ := m["message"].(string); !strings.Contains(msg, "no torrent recorded") {
+			t.Errorf("message = %q, want it to say why", msg)
 		}
 		data, _ := env.jobs.Get("job-err")
-		if data["status"] != "queued" {
-			t.Errorf("status after retry = %v, want queued", data["status"])
+		if data["status"] != "error" {
+			t.Errorf("status after a refused retry = %v, want error", data["status"])
 		}
 	})
 
@@ -303,8 +310,20 @@ func TestBulkRetryAndCancel(t *testing.T) {
 		rr := env.do("POST", "/api/admin/bulk/retry", "")
 		wantStatus(t, rr, 200)
 		m := decodeMap(t, rr)
-		if m["requested"] != float64(2) || m["succeeded"] != float64(2) {
-			t.Errorf("bulk retry = %v, want requested=2 succeeded=2", m)
+		// Both are attempted; neither can start, since neither job records a
+		// torrent. The per-job result is what carries the reason.
+		if m["requested"] != float64(2) || m["succeeded"] != float64(0) {
+			t.Errorf("bulk retry = %v, want requested=2 succeeded=0", m)
+		}
+		results, _ := m["results"].([]interface{})
+		if len(results) != 2 {
+			t.Fatalf("results = %v, want one per requested job", m["results"])
+		}
+		for _, r := range results {
+			row, _ := r.(map[string]interface{})
+			if msg, _ := row["message"].(string); msg == "" {
+				t.Errorf("result %v carries no reason", row)
+			}
 		}
 	})
 
