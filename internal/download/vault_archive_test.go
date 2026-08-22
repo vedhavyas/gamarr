@@ -321,6 +321,85 @@ func TestArchiveAlreadyInVaultKeepsTheDownload(t *testing.T) {
 	}
 }
 
+// The stored setting outranks VAULT_ARCHIVE_ENABLED, and a settings file
+// written before the option existed leaves the environment default alone.
+// Without that last part, upgrading turns archiving off for every install that
+// set the variable.
+func TestVaultArchiveSettingOverridesEnvDefault(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	m := New(cfg, newTestJobs(t), nil)
+
+	if !m.vaultArchiveEnabled() {
+		t.Error("with nothing stored, the environment default should apply")
+	}
+
+	writeFileT(t, filepath.Join(cfg.DataDir, "settings.json"), []byte(`{"import_mode":"copy"}`))
+	if !m.vaultArchiveEnabled() {
+		t.Error("a settings file without the key turned archiving off")
+	}
+	// The settings API serialises this, so an unresolved value renders the
+	// checkbox unchecked while archiving is actually on.
+	if v := m.LoadSettings().VaultArchiveEnabled; v == nil || !*v {
+		t.Errorf("LoadSettings reported %v for a legacy settings file, want the effective value", v)
+	}
+
+	off := false
+	m.SaveSettings(&Settings{VaultArchiveEnabled: &off})
+	if m.vaultArchiveEnabled() {
+		t.Error("a stored false should outrank the environment default")
+	}
+}
+
+// The setting has to reach the import, not just the settings API.
+func TestVaultArchiveSettingDrivesTheImport(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	cfg.ImportMode = fileops.ModeCopy
+	m := New(cfg, newTestJobs(t), newQbitMock(t).client())
+	off := false
+	m.SaveSettings(&Settings{VaultArchiveEnabled: &off})
+
+	content := filepath.Join(t.TempDir(), "Setting Game")
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeGame(jobID, &qbit.Torrent{Name: "Setting Game", Hash: "vs1", ContentPath: content}, "PC", "", true)
+
+	if pathExists(filepath.Join(cfg.GamesVaultPath, "Setting Game.tar")) {
+		t.Error("archived despite the stored setting being off")
+	}
+	if !pathExists(filepath.Join(cfg.GamesVaultPath, "Setting Game", "setup.exe")) {
+		t.Error("not imported as a folder with archiving off")
+	}
+}
+
+// The usenet path reads the setting through the same accessor, and it is a
+// separate call site: a torrent-path test cannot tell whether this one was
+// converted.
+func TestVaultArchiveSettingDrivesTheNZBImport(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.VaultArchiveEnabled = true
+	m := New(cfg, newTestJobs(t), nil)
+	off := false
+	m.SaveSettings(&Settings{VaultArchiveEnabled: &off})
+
+	storage := filepath.Join(t.TempDir(), "NZB Game")
+	writeFileT(t, filepath.Join(storage, "setup.exe"), []byte("installer"))
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
+
+	m.organizeNZBDownload(jobID, storage, "NZB Game", "PC", "", true)
+
+	if pathExists(filepath.Join(cfg.GamesVaultPath, "NZB Game.tar")) {
+		t.Error("archived despite the stored setting being off")
+	}
+	if !pathExists(filepath.Join(cfg.GamesVaultPath, "NZB Game", "setup.exe")) {
+		t.Error("not imported as a folder with archiving off")
+	}
+}
+
 // The accepted path has to be the occupant, not the name this import would have
 // written, and those two only differ when the vault holds the un-suffixed name.
 // An earlier single-file import of the same game lands exactly there, so a
