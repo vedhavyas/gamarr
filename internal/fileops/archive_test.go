@@ -2,6 +2,7 @@ package fileops
 
 import (
 	"archive/tar"
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -153,6 +154,119 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 
 	if names := vaultEntries(t, vault); len(names) != 1 || names[0] != "007 First Light.tar" {
 		t.Errorf("vault holds %v, want just the archive", names)
+	}
+}
+
+// The format has to survive what FileInfoHeader actually produces on a real
+// file, not just a hand-built header.
+func TestArchiveWritesGNUHeaders(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+	writeFile(t, filepath.Join(src, "data", "fg-01.bin"), "PAYLOAD")
+
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, dest); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	raw, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if strings.Contains(string(raw), "PaxHeaders") {
+		t.Error("a real archive still carries a PAX extended header")
+	}
+	// Bytes 345 to 500 of a header block are the ustar path prefix, and GNU
+	// reuses them for atime and ctime. Go's reader knows the difference and a
+	// prefix-reading one does not, so assert the bytes rather than the fields.
+	for off := 0; off+512 <= len(raw); off += 512 {
+		blk := raw[off : off+512]
+		if string(blk[257:262]) != "ustar" {
+			continue
+		}
+		for i, b := range blk[345:500] {
+			if b != 0 {
+				t.Fatalf("header at offset %d has %#x in the ustar prefix field at +%d, which a prefix-reading extractor prepends to the name", off, b, i)
+			}
+		}
+	}
+	tr := tar.NewReader(bytes.NewReader(raw))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read archive: %v", err)
+		}
+		if hdr.Format != tar.FormatGNU {
+			t.Errorf("%s written as %v, want GNU", hdr.Name, hdr.Format)
+		}
+	}
+}
+
+// A member past the ustar ceiling has to carry its size in the header, not in a
+// PAX extended header. The header declares the size and the body is never
+// written: asserting a header field is not worth 9 GiB of I/O. The over-long
+// Uname is the input that would otherwise push the writer to PAX.
+func TestWriteGNUHeaderKeepsALargeMemberOutOfPax(t *testing.T) {
+	var buf bytes.Buffer
+	hdr := &tar.Header{
+		Name:     "fg-01.bin",
+		Mode:     0644,
+		Size:     9 << 30,
+		Uname:    strings.Repeat("u", 40),
+		ModTime:  time.Unix(1700000000, 0),
+		Typeflag: tar.TypeReg,
+	}
+	if err := writeGNUHeader(tar.NewWriter(&buf), hdr); err != nil {
+		t.Fatalf("writeGNUHeader: %v", err)
+	}
+
+	if strings.Contains(buf.String(), "PaxHeaders") {
+		t.Error("fell back to PAX, which is the format this exists to avoid")
+	}
+	got, err := tar.NewReader(bytes.NewReader(buf.Bytes())).Next()
+	if err != nil {
+		t.Fatalf("read back the header: %v", err)
+	}
+	if got.Format != tar.FormatGNU {
+		t.Errorf("format = %v, want GNU", got.Format)
+	}
+	if got.Uname != "" {
+		t.Errorf("Uname = %q, want it cleared to keep the format", got.Uname)
+	}
+	if got.Name != "fg-01.bin" || got.Size != 9<<30 {
+		t.Errorf("header = %q at %d bytes, want fg-01.bin at %d", got.Name, got.Size, int64(9<<30))
+	}
+}
+
+// Forcing a format stops the writer normalising times, and atime and ctime then
+// occupy the bytes a ustar reader takes for a path prefix.
+func TestWriteGNUHeaderNormalisesTimes(t *testing.T) {
+	var buf bytes.Buffer
+	hdr := &tar.Header{
+		Name: "setup.exe", Mode: 0644, Typeflag: tar.TypeReg,
+		ModTime:    time.Unix(1700000000, 900000000),
+		AccessTime: time.Unix(1600000000, 0),
+		ChangeTime: time.Unix(1650000000, 0),
+	}
+	if err := writeGNUHeader(tar.NewWriter(&buf), hdr); err != nil {
+		t.Fatalf("writeGNUHeader: %v", err)
+	}
+
+	got, err := tar.NewReader(bytes.NewReader(buf.Bytes())).Next()
+	if err != nil {
+		t.Fatalf("read back the header: %v", err)
+	}
+	if !got.AccessTime.IsZero() || !got.ChangeTime.IsZero() {
+		t.Errorf("atime %v, ctime %v, want both cleared", got.AccessTime, got.ChangeTime)
+	}
+	// GNU stores whole seconds, so an unrounded mtime is floored rather than
+	// rounded and this lands a second early.
+	if got.ModTime.Unix() != 1700000001 {
+		t.Errorf("mtime = %d, want 1700000001", got.ModTime.Unix())
 	}
 }
 
