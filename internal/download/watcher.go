@@ -1,9 +1,7 @@
 package download
 
 import (
-	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -156,95 +154,25 @@ func (w *Watcher) importTorrent(t qbit.Torrent) {
 		"detail":        "Auto-importing completed torrent...",
 	})
 
-	attempt := 0
-	// Empty means the import wrote its own terminal state and nothing here may
-	// overwrite it: a quarantined download has already had its files deleted, and
-	// telling the user to go organize it by hand would be wrong.
-	var giveUp string
-	for {
-		attempt++
-		retryable := w.mgr.organizeWithScan(jobID, &t, platf, platSlug, isPC)
+	if w.mgr.importFinishedTorrent("watcher", jobID, t, platf, platSlug, isPC) {
+		w.imported.Store(t.Hash, struct{}{})
 
-		if job, ok := w.mgr.Jobs().Get(jobID); ok {
-			if status, _ := job["status"].(string); status == "completed" {
-				w.imported.Store(t.Hash, struct{}{})
-				slog.Info("watcher: auto-import completed", "name", t.Name, "attempts", attempt)
-
-				// Optionally remove the torrent after import.
-				if w.cfg.RemoveAfterImport {
-					w.mgr.QB().DeleteTorrent(t.Hash, false)
-					slog.Info("watcher: removed torrent after import", "name", t.Name)
-				}
-
-				// Send notification.
-				if w.mgr.NotifyFunc != nil {
-					w.mgr.NotifyFunc("", "download_complete", t.Name,
-						"Auto-imported by watcher: "+t.Name+" ("+platf+")")
-				}
-				return
-			}
+		// Optionally remove the torrent after import.
+		if w.cfg.RemoveAfterImport {
+			w.mgr.QB().DeleteTorrent(t.Hash, false)
+			slog.Info("watcher: removed torrent after import", "name", t.Name)
 		}
 
-		if !retryable {
-			break
+		// Send notification.
+		if w.mgr.NotifyFunc != nil {
+			w.mgr.NotifyFunc("", "download_complete", t.Name,
+				"Auto-imported by watcher: "+t.Name+" ("+platf+")")
 		}
-		if attempt >= importAttempts {
-			giveUp = fmt.Sprintf("Gave up after %d attempts. The download is still in the client, "+
-				"so organize it by hand once the files are in place.", attempt)
-			break
-		}
-
-		// organizing is a status the job store rewrites to interrupted on startup.
-		// Left at error, a restart during the wait leaves a row reading as retrying
-		// with nothing retrying it.
-		w.mgr.Jobs().UpdateMulti(jobID, map[string]interface{}{
-			"status": "organizing",
-			"detail": fmt.Sprintf("Waiting for the download client to publish the finished files, attempt %d of %d", attempt, importAttempts),
-		})
-		time.Sleep(importRetryDelay)
-
-		// Ask the client again rather than reusing the value that just failed:
-		// content_path changes when the client publishes the finished download.
-		fresh, found, err := w.torrentByHash(t.Hash)
-		switch {
-		case err != nil:
-			slog.Warn("watcher: could not re-read the torrent, trying again",
-				"name", t.Name, "error", err)
-		case !found:
-			giveUp = "The download client no longer lists this torrent, so there is nothing left to import."
-		default:
-			t = fresh
-		}
-		if giveUp != "" {
-			break
-		}
+		return
 	}
 
 	// Bounded rather than disabled. The guard this replaces was right that a
 	// broken import must not spin forever, but it could not tell a transient miss
 	// from a permanent one and so treated every failure as permanent.
 	w.imported.Store(t.Hash, struct{}{})
-	if giveUp != "" {
-		w.mgr.Jobs().UpdateMulti(jobID, map[string]interface{}{
-			"status": "error", "detail": giveUp,
-		})
-	}
-	slog.Warn("watcher: auto-import did not complete", "name", t.Name, "attempts", attempt)
-}
-
-// torrentByHash re-reads a torrent from the client by exact hash. The bool means
-// anything only when the error is nil: a read that failed is not evidence the
-// client stopped holding the torrent, and acting on it as though it were turns
-// one bad request into a permanent give-up.
-func (w *Watcher) torrentByHash(hash string) (qbit.Torrent, bool, error) {
-	torrents, err := w.mgr.QB().GetTorrents(w.cfg.QBCategory)
-	if err != nil {
-		return qbit.Torrent{}, false, err
-	}
-	for _, t := range torrents {
-		if strings.EqualFold(t.Hash, hash) {
-			return t, true, nil
-		}
-	}
-	return qbit.Torrent{}, false, nil
 }
