@@ -557,6 +557,12 @@ func importDetail(mode fileops.Mode, target string) string {
 // retryable signal would error the job permanently, and an errored job then
 // stops the watcher rescuing it.
 func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf, platSlug string, isPC bool) bool {
+	// Record the hash the give-up message tells the user to retry with. The job
+	// row's own copy comes from a request parameter that is empty for any
+	// result carrying a .torrent URL rather than a magnet, and this is the one
+	// place that holds the torrent itself.
+	m.jobs.Update(jobID, "info_hash", t.Hash)
+
 	if _, busy := m.importing.LoadOrStore(jobID, struct{}{}); busy {
 		slog.Warn("an import is already running for this job", "via", via, "job", jobID)
 		return false

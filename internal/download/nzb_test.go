@@ -694,3 +694,38 @@ func TestImportFinishedTorrentRefusesASecondRunForTheSameJob(t *testing.T) {
 		t.Errorf("status = %q, want the row untouched by a refused import", status)
 	}
 }
+
+// The give-up message tells the user to press Retry, so the row it writes has to
+// be one Retry can act on. The hash reaches the job from a request parameter
+// that is empty for any result carrying a .torrent URL, so recording it at the
+// creation sites left whichever site nobody had patched yet still broken.
+func TestGiveUpLeavesARowRetryCanActOn(t *testing.T) {
+	setImportRetries(t, 2, time.Millisecond)
+	qm := newQbitMock(t)
+	cfg := newTestConfig(t)
+	cfg.QBURL = "configured"
+	m := New(cfg, newTestJobs(t), qm.client())
+
+	torrent := qbit.Torrent{
+		Name: "No Hash Recorded", Hash: "nh-hash", Progress: 1.0,
+		SavePath: cfg.QBSavePath, ContentPath: filepath.Join(cfg.QBSavePath, "pending"),
+	}
+	qm.setTorrents([]qbit.Torrent{torrent})
+
+	// The row as the download path writes it: no hash.
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{"status": "downloading", "title": torrent.Name})
+
+	m.importFinishedTorrent("job watch", jobID, torrent, "PC", "", true)
+
+	job, _ := m.Jobs().Get(jobID)
+	if detail, _ := job["detail"].(string); !strings.Contains(detail, "Retry") {
+		t.Fatalf("detail = %q, want it to point at Retry", detail)
+	}
+	if got, _ := job["info_hash"].(string); got != "nh-hash" {
+		t.Errorf("info_hash = %q, want the torrent the message says to retry", got)
+	}
+	if _, msg := m.RetryJob(jobID); strings.Contains(msg, "no torrent recorded") {
+		t.Errorf("Retry refused the row its own message told the user to press: %s", msg)
+	}
+}
