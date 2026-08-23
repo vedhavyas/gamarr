@@ -147,6 +147,7 @@ func (w *Watcher) importTorrent(t qbit.Torrent) {
 	w.mgr.Jobs().Set(jobID, map[string]interface{}{
 		"status":        "organizing",
 		"title":         t.Name,
+		"info_hash":     t.Hash,
 		"platform":      platf,
 		"platform_slug": platSlug,
 		"is_pc":         isPC,
