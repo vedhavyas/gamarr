@@ -13,6 +13,7 @@ import (
 	"gamarr/internal/models"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // ── Wishlist CRUD ──────────────────────────────────────────────────────────────
@@ -328,7 +329,12 @@ func TestBulkRetryAndCancel(t *testing.T) {
 	}))
 	defer qb.Close()
 
-	env := newTestEnv(t, func(c *config.Config) { c.QBURL = qb.URL })
+	env := newTestEnv(t, func(c *config.Config) {
+		c.QBURL = qb.URL
+		// Without these the import destination is relative and resolves against
+		// the package source directory.
+		c.QBSavePath, c.GamesVaultPath, c.GamesRomsPath = t.TempDir(), t.TempDir(), t.TempDir()
+	})
 	env.jobs.Set("f1", map[string]interface{}{
 		"status": "error", "title": "F1", "info_hash": "f1-hash", "is_pc": true,
 	})
@@ -347,6 +353,20 @@ func TestBulkRetryAndCancel(t *testing.T) {
 		results, _ := m["results"].([]interface{})
 		if len(results) != 2 {
 			t.Fatalf("results = %v, want one per requested job", m["results"])
+		}
+		// The retry runs in a goroutine, so wait for it rather than returning
+		// while it is still writing.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if job, ok := env.jobs.Get("f1"); ok {
+				if s, _ := job["status"].(string); s == "completed" {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if job, _ := env.jobs.Get("f1"); job["status"] != "completed" {
+			t.Errorf("f1 status = %v, want completed", job["status"])
 		}
 		for _, r := range results {
 			row, _ := r.(map[string]interface{})
