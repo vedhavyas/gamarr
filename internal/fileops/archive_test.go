@@ -157,6 +157,109 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 	}
 }
 
+// twoFileArchive builds a source of two regular files and its archive.
+func twoFileArchive(t *testing.T) (string, string, int64) {
+	t.Helper()
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "setup.exe"), strings.Repeat("SETUP...", 448))
+	writeFile(t, filepath.Join(src, "fg-01.bin"), strings.Repeat("PAYLOAD.", 256))
+
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, dest); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	_, wantBytes, err := censusOf(src)
+	if err != nil {
+		t.Fatalf("census: %v", err)
+	}
+	return src, dest, wantBytes
+}
+
+// An archive whose tail is missing must not authorise dropping the download.
+// Comparing the tar's file size against the source's content bytes cannot catch
+// this: a tar also carries a header per entry, padding and a 1024-byte trailer,
+// so it is always larger than the content by an amount that comparison treats
+// as slack.
+func TestVerifyArchiveRejectsATruncatedArchive(t *testing.T) {
+	src, dest, wantBytes := twoFileArchive(t)
+
+	// Longer than the source's content bytes, so a size comparison accepts it,
+	// and short enough to cut into the last member.
+	if err := os.Truncate(dest, wantBytes+512); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	if err := VerifyArchive(dest, src); err == nil {
+		t.Error("accepted a truncated archive, which would authorise deleting the only other copy")
+	}
+}
+
+// A symlink entry is header-only: the reader checks nothing against its declared
+// size, so counting one as a file lets 512 bytes of header stand in for the
+// entire payload.
+func TestVerifyArchiveRejectsAHeaderOnlyEntry(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "fg-01.bin"), strings.Repeat("PAYLOAD.", 4096))
+	_, wantBytes, err := censusOf(src)
+	if err != nil {
+		t.Fatalf("census: %v", err)
+	}
+
+	// One entry claiming the whole payload while carrying no body at all.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "fg-01.bin", Typeflag: tar.TypeSymlink, Linkname: "elsewhere",
+		Size: wantBytes, Format: tar.FormatGNU,
+	}); err != nil {
+		t.Fatalf("write symlink header: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(dest, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+
+	if err := VerifyArchive(dest, src); err == nil {
+		t.Errorf("accepted a %d-byte archive holding no content as a stand-in for %d bytes",
+			buf.Len(), wantBytes)
+	}
+}
+
+// Reading one header validates one entry. Everything after it has to be walked
+// or a tar whose later entries are destroyed still passes.
+func TestVerifyArchiveRejectsCorruptionPastTheFirstEntry(t *testing.T) {
+	src, dest, _ := twoFileArchive(t)
+
+	raw, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	// Derive where the second header starts rather than coupling to the
+	// fixture: one header block plus the first body padded to a block boundary.
+	first, err := tar.NewReader(bytes.NewReader(raw)).Next()
+	if err != nil {
+		t.Fatalf("read the first header: %v", err)
+	}
+	for i := 512 + int((first.Size+511)/512)*512; i < len(raw); i++ {
+		raw[i] = 0xFF
+	}
+	if err := os.WriteFile(dest, raw, 0644); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+
+	if err := VerifyArchive(dest, src); err == nil {
+		t.Error("accepted an archive destroyed past its first entry")
+	}
+}
+
 // The format has to survive what FileInfoHeader actually produces on a real
 // file, not just a hand-built header.
 func TestArchiveWritesGNUHeaders(t *testing.T) {
@@ -278,6 +381,12 @@ func TestVerifyArchive(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "Game")
 	writeFile(t, filepath.Join(src, "setup.exe"), strings.Repeat("PAYLOAD", 512))
+	// A repack ships empty directories. The tar carries an entry for each and
+	// the census counts none of them, so the walk has to agree or every real
+	// archive fails by the directory count.
+	if err := os.MkdirAll(filepath.Join(src, "Saves"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 
 	good := ArchiveDest(filepath.Join(root, "vault", "Game"))
 	if err := Archive(src, good); err != nil {

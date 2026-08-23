@@ -64,12 +64,18 @@ func ArchiveHolds(path, src string) bool {
 	return err == nil && fi.Size() >= wantBytes
 }
 
-// VerifyArchive reports whether the archive at dest can stand in for src: a
-// readable tar holding at least the bytes src's files add up to.
+// VerifyArchive reports whether the archive at dest can stand in for src: every
+// regular file the source held, present in the tar at the size its header
+// declares. Bodies are not read, so their contents are not checked.
 //
-// This is what authorises dropping src. It re-reads the published file rather
-// than trusting a successful write, so a truncated or unreadable archive cannot
-// take the source with it.
+// This is what authorises dropping src, so it walks the whole archive to EOF
+// rather than sampling the front of it. Bodies are skipped rather than read,
+// which keeps it cheap on a large archive, and the reader turns a body shorter
+// than its header declares into an error rather than a quiet early end.
+//
+// Counts and sizes come from the same census Archive wrote from, so both sides
+// count regular files and neither counts the directory entries the tar also
+// carries.
 func VerifyArchive(dest, src string) error {
 	fi, err := os.Lstat(dest)
 	if err != nil {
@@ -78,20 +84,38 @@ func VerifyArchive(dest, src string) error {
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", dest)
 	}
-	_, wantBytes, err := censusOf(src)
+	wantFiles, wantBytes, err := censusOf(src)
 	if err != nil {
 		return err
-	}
-	if fi.Size() < wantBytes {
-		return fmt.Errorf("archive %s holds %d bytes, source has %d", dest, fi.Size(), wantBytes)
 	}
 	f, err := os.Open(dest)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if _, err := tar.NewReader(f).Next(); err != nil {
-		return fmt.Errorf("archive %s is not readable: %w", dest, err)
+
+	var gotFiles, gotBytes int64
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("archive %s is not readable past %d files: %w", dest, gotFiles, err)
+		}
+		// Positively, not by excluding directories: a symlink or device entry
+		// is header-only, so the reader checks nothing against its declared
+		// size and 512 bytes of header would stand in for a whole payload.
+		if !hdr.FileInfo().Mode().IsRegular() {
+			continue
+		}
+		gotFiles++
+		gotBytes += hdr.Size
+	}
+	if gotFiles != wantFiles || gotBytes != wantBytes {
+		return fmt.Errorf("archive %s holds %d files and %d bytes, source has %d and %d",
+			dest, gotFiles, gotBytes, wantFiles, wantBytes)
 	}
 	return nil
 }
