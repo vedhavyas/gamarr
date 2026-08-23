@@ -461,7 +461,13 @@ function renderDownloads(downloads) {
     </div>`;
   }).join('');
 }
-async function retryJob(id) { await api(`/api/downloads/${id}/retry`, {method:'POST'}); pollDownloads(); toast('Retrying...', 'success'); }
+async function retryJob(id) {
+  try {
+    const d = await (await api(`/api/downloads/${id}/retry`, {method:'POST'})).json();
+    if (d.success) toast(d.message || 'Retrying...', 'success'); else toast(d.error || 'Retry failed', 'error');
+  } catch(e) { toast('Retry failed', 'error'); }
+  pollDownloads();
+}
 async function removeTorrent(h) { await api(`/api/downloads/torrent/${h}`, {method:'DELETE'}); pollDownloads(); }
 async function removeJob(id) { await api(`/api/downloads/${id}`, {method:'DELETE'}); pollDownloads(); }
 async function clearFinished() { await api('/api/downloads/clear', {method:'POST'}); pollDownloads(); toast('Cleared', 'success'); }

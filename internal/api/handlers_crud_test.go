@@ -11,6 +11,8 @@ import (
 	"gamarr/internal/config"
 	"gamarr/internal/db"
 	"gamarr/internal/models"
+	"os"
+	"path/filepath"
 )
 
 // ── Wishlist CRUD ──────────────────────────────────────────────────────────────
@@ -272,21 +274,30 @@ func TestRetryJob(t *testing.T) {
 	env := newTestEnv(t, nil)
 	env.jobs.Set("job-err", map[string]interface{}{"status": "error", "title": "Broken"})
 
-	t.Run("failed job requeued", func(t *testing.T) {
+	// A job with no torrent recorded has nothing to import again, and the row
+	// stays where the UI still offers a button. It used to report success and
+	// park at "queued", which nothing consumed and nothing could act on.
+	t.Run("job with no torrent reports failure", func(t *testing.T) {
 		rr := env.do("POST", "/api/downloads/job-err/retry", "")
-		wantStatus(t, rr, 200)
-		if m := decodeMap(t, rr); m["success"] != true {
-			t.Errorf("retry failed: %v", m)
+		// A refusal is a client error, and every non-browser consumer reads the
+		// status before it reads the body.
+		wantStatus(t, rr, 400)
+		m := decodeMap(t, rr)
+		if m["success"] != false {
+			t.Errorf("retry reported success with no torrent to import: %v", m)
+		}
+		if msg, _ := m["error"].(string); !strings.Contains(msg, "no torrent recorded") {
+			t.Errorf("error = %q, want it to say why", msg)
 		}
 		data, _ := env.jobs.Get("job-err")
-		if data["status"] != "queued" {
-			t.Errorf("status after retry = %v, want queued", data["status"])
+		if data["status"] != "error" {
+			t.Errorf("status after a refused retry = %v, want error", data["status"])
 		}
 	})
 
 	t.Run("missing job reports failure", func(t *testing.T) {
 		rr := env.do("POST", "/api/downloads/missing/retry", "")
-		wantStatus(t, rr, 200)
+		wantStatus(t, rr, 400)
 		if m := decodeMap(t, rr); m["success"] != false {
 			t.Errorf("expected success=false for missing job, got %v", m)
 		}
@@ -294,8 +305,33 @@ func TestRetryJob(t *testing.T) {
 }
 
 func TestBulkRetryAndCancel(t *testing.T) {
-	env := newTestEnv(t, nil)
-	env.jobs.Set("f1", map[string]interface{}{"status": "error", "title": "F1"})
+	// One fixture records a torrent the client actually holds, so the bulk path
+	// reaches the retry rather than short-circuiting on a missing hash. Without
+	// it every request returns at the first check and the endpoint stays green
+	// under a full revert.
+	content := t.TempDir()
+	if err := os.WriteFile(filepath.Join(content, "setup.exe"), []byte("installer"), 0644); err != nil {
+		t.Fatalf("stage content: %v", err)
+	}
+	qb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			json.NewEncoder(w).Encode([]map[string]interface{}{{
+				"name": "F1", "hash": "f1-hash", "progress": 1.0,
+				"save_path": content, "content_path": content,
+			}})
+		default:
+			w.WriteHeader(200)
+		}
+	}))
+	defer qb.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.QBURL = qb.URL })
+	env.jobs.Set("f1", map[string]interface{}{
+		"status": "error", "title": "F1", "info_hash": "f1-hash", "is_pc": true,
+	})
 	env.jobs.Set("f2", map[string]interface{}{"status": "dead_letter", "title": "F2"})
 	env.jobs.Set("a1", map[string]interface{}{"status": "downloading", "title": "A1"})
 
@@ -303,8 +339,20 @@ func TestBulkRetryAndCancel(t *testing.T) {
 		rr := env.do("POST", "/api/admin/bulk/retry", "")
 		wantStatus(t, rr, 200)
 		m := decodeMap(t, rr)
-		if m["requested"] != float64(2) || m["succeeded"] != float64(2) {
-			t.Errorf("bulk retry = %v, want requested=2 succeeded=2", m)
+		// f1 records a torrent the client holds, so its retry starts; f2 records
+		// none, so it is refused with a reason.
+		if m["requested"] != float64(2) || m["succeeded"] != float64(1) {
+			t.Errorf("bulk retry = %v, want requested=2 succeeded=1", m)
+		}
+		results, _ := m["results"].([]interface{})
+		if len(results) != 2 {
+			t.Fatalf("results = %v, want one per requested job", m["results"])
+		}
+		for _, r := range results {
+			row, _ := r.(map[string]interface{})
+			if msg, _ := row["message"].(string); msg == "" {
+				t.Errorf("result %v carries no reason", row)
+			}
 		}
 	})
 

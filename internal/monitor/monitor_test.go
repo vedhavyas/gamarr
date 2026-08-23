@@ -494,3 +494,40 @@ func TestActRestartQBittorrent_NoSocket(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// GetJobs hands back detached copies, so the monitor's own retry mutated a
+// throwaway map: nothing reached the cache or the database while it reported
+// success at three layers, and under auto-fix it did so unattended.
+func TestActRetryJobDelegatesRatherThanWritingACopy(t *testing.T) {
+	var gotJobID string
+	m := New(&config.Config{}, Callbacks{
+		GetJobs: func() []struct {
+			ID   string
+			Data map[string]interface{}
+		} {
+			return []struct {
+				ID   string
+				Data map[string]interface{}
+			}{{ID: "j1", Data: map[string]interface{}{"status": "error"}}}
+		},
+		RetryJob: func(jobID string) (bool, string) {
+			gotJobID = jobID
+			return true, "Retrying (#1)"
+		},
+	})
+
+	if msg := m.actRetryJob("j1"); msg != "Retrying (#1)" {
+		t.Errorf("msg = %q, want the real retry's own answer", msg)
+	}
+	if gotJobID != "j1" {
+		t.Errorf("delegated for %q, want j1", gotJobID)
+	}
+}
+
+// With no retry wired the action has to say so rather than claim success.
+func TestActRetryJobWithoutACallback(t *testing.T) {
+	m := New(&config.Config{}, Callbacks{})
+	if msg := m.actRetryJob("j1"); !strings.Contains(msg, "not available") {
+		t.Errorf("msg = %q, want it to say retry is unavailable", msg)
+	}
+}

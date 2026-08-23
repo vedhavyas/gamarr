@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"gamarr/internal/config"
@@ -42,6 +43,15 @@ type Manager struct {
 	deluge       *DelugeClient
 	nzbget       *nzbget.Client
 	NotifyFunc   NotifyCallback
+
+	// importing holds the jobs an import is currently running for. Two imports
+	// on one job race for its source: whichever moves it first wins, and the
+	// loser stats the emptied path, reads it as missing and overwrites the
+	// winner's completed row with a failure blaming the user's mounts.
+	importing sync.Map
+	// retryMu serialises RetryJob's read-check-write, which is otherwise two
+	// separate lock acquisitions that two clicks can both pass.
+	retryMu sync.Mutex
 }
 
 // New creates a new download Manager.
@@ -202,6 +212,7 @@ func (m *Manager) OrganizeTorrent(hash, platf, platSlug string, isPC bool) (stri
 	m.jobs.Set(jobID, map[string]interface{}{
 		"status":        "organizing",
 		"title":         torrent.Name,
+		"info_hash":     torrent.Hash,
 		"platform":      platf,
 		"platform_slug": platSlug,
 		"is_pc":         isPC,
@@ -546,6 +557,12 @@ func importDetail(mode fileops.Mode, target string) string {
 // retryable signal would error the job permanently, and an errored job then
 // stops the watcher rescuing it.
 func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf, platSlug string, isPC bool) bool {
+	if _, busy := m.importing.LoadOrStore(jobID, struct{}{}); busy {
+		slog.Warn("an import is already running for this job", "via", via, "job", jobID)
+		return false
+	}
+	defer m.importing.Delete(jobID)
+
 	attempt := 0
 	// Empty means the import wrote its own terminal state and nothing here may
 	// overwrite it: a quarantined download has already had its files deleted, and
@@ -567,7 +584,7 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 		}
 		if attempt >= importAttempts {
 			giveUp = fmt.Sprintf("Gave up after %d attempts. The download is still in the client, "+
-				"so organize it by hand once the files are in place.", attempt)
+				"so use Retry once the files are in place.", attempt)
 			break
 		}
 
