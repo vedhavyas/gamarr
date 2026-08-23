@@ -44,12 +44,13 @@ type Manager struct {
 	nzbget       *nzbget.Client
 	NotifyFunc   NotifyCallback
 
-	// retrying holds the jobs a retry is running for, claimed under retryMu so
-	// the check and the claim are one step. Two retries on one row race for its
-	// source: whichever moves it first wins, and the loser stats the emptied
-	// path, reads it as missing and overwrites the winner's completed row with a
-	// failure blaming the user's mounts.
-	retrying sync.Map
+	// importing holds the download hashes an import is running for. Two imports
+	// of one download race for its path: whichever moves it first wins, and the
+	// loser stats the emptied path, reads it as missing and writes a failure
+	// blaming the user's mounts. Keyed by hash rather than job id because
+	// OrganizeTorrent mints a fresh job per call, so two rows can name one
+	// physical download.
+	importing sync.Map
 }
 
 // New creates a new download Manager.
@@ -551,10 +552,25 @@ func importDetail(mode fileops.Mode, target string) string {
 //
 // A client publishes a finished download by renaming it into place, so a path
 // missing the instant progress reads complete is a race rather than a verdict.
-// Every caller that imports comes through here: a caller that discarded the
-// retryable signal would error the job permanently, and an errored job then
-// stops the watcher rescuing it.
+// Every caller that imports comes through here, which is what makes the retry
+// and the claim below cover all of them; the returned bool is a convenience for
+// callers that act on success, since the terminal state is written to the job
+// row here before returning either way.
 func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf, platSlug string, isPC bool) bool {
+	// Claimed here rather than in any caller, so every path that imports is
+	// excluded rather than only the one that was looked at.
+	if _, busy := m.importing.LoadOrStore(t.Hash, struct{}{}); busy {
+		slog.Warn("an import is already running for this download", "via", via, "name", sanitizeLog(t.Name))
+		// A refusal has to leave a row the user can act on: left at organizing
+		// it would carry no button, count as active and never be pruned.
+		m.jobs.UpdateMulti(jobID, map[string]interface{}{
+			"status": "error",
+			"detail": "Another import is already running for this download.",
+		})
+		return false
+	}
+	defer m.importing.Delete(t.Hash)
+
 	// Record the hash the give-up message tells the user to retry with. The job
 	// row's own copy comes from a request parameter that is empty for any
 	// result carrying a .torrent URL rather than a magnet, and this is the one

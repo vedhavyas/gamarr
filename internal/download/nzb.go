@@ -407,22 +407,6 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 	if status != "error" && status != "interrupted" && status != "dead_letter" {
 		return false, fmt.Sprintf("Job not in failed state (status=%s)", status)
 	}
-	// The claim is what serialises two clicks, and it has to be the check as
-	// well: the status alone cannot say whether a retry is already running,
-	// since its import writes "error" on every failed attempt before writing
-	// "organizing" back, so a click landing in that window reads a row that
-	// looks idle. LoadOrStore settles it in one atomic step.
-	if _, busy := m.retrying.LoadOrStore(jobID, struct{}{}); busy {
-		return false, "A retry is already running for this job"
-	}
-
-	started := false
-	defer func() {
-		if !started {
-			m.retrying.Delete(jobID)
-		}
-	}()
-
 	hash := strVal(job, "info_hash")
 	if hash == "" {
 		return false, "This job has no torrent recorded, so there is nothing to import again"
@@ -438,6 +422,13 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 		return false, "That download has not finished yet"
 	}
 
+	// Advisory only. The import's own claim is what excludes a second one; this
+	// just answers with the specific reason before touching the row, since the
+	// status alone cannot say whether an import is running.
+	if _, busy := m.importing.Load(torrent.Hash); busy {
+		return false, "An import is already running for this download"
+	}
+
 	retryCount := 0
 	if rc, ok := job["retry_count"].(float64); ok {
 		retryCount = int(rc)
@@ -451,11 +442,7 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 		"retry_count": retryCount + 1,
 	})
 	m.jobs.LogActivity("download_retried", strVal(job, "title"), fmt.Sprintf("Retry #%d", retryCount+1), jobID, nil)
-	started = true
-	go func() {
-		defer m.retrying.Delete(jobID)
-		m.importFinishedTorrent("retry", jobID, torrent, strVal(job, "platform"), strVal(job, "platform_slug"), isPC)
-	}()
+	go m.importFinishedTorrent("retry", jobID, torrent, strVal(job, "platform"), strVal(job, "platform_slug"), isPC)
 	return true, fmt.Sprintf("Retrying (#%d)", retryCount+1)
 }
 
