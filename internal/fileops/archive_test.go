@@ -156,8 +156,54 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 	}
 }
 
-// Archiving reads the source and writes a new file, so it can never be a move:
-// a torrent stays seedable and IMPORT_MODE cannot make an archive delete data.
+// VerifyArchive is what authorises dropping a source, so every way an occupant
+// can fail to be an archive of src has to refuse. Size alone does not: a
+// hand-placed file large enough to clear the census reads as one until the tar
+// header is actually parsed.
+func TestVerifyArchive(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "setup.exe"), strings.Repeat("PAYLOAD", 512))
+
+	good := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, good); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if err := VerifyArchive(good, src); err != nil {
+		t.Errorf("VerifyArchive on a real archive of the source: %v", err)
+	}
+
+	// A real archive, but of less content than src. It parses as a tar, so only
+	// the census comparison can refuse it.
+	smallSrc := filepath.Join(root, "Small")
+	writeFile(t, filepath.Join(smallSrc, "setup.exe"), "SETUP")
+	short := ArchiveDest(filepath.Join(root, "other-vault", "Small"))
+	if err := Archive(smallSrc, short); err != nil {
+		t.Fatalf("Archive the smaller source: %v", err)
+	}
+
+	junk := filepath.Join(root, "junk.tar")
+	writeFile(t, junk, strings.Repeat("not a tar", 1024))
+	adir := filepath.Join(root, "adir.tar")
+	if err := os.MkdirAll(adir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	for name, path := range map[string]string{
+		"a file too short to hold the source": short,
+		"a file that is not a tar at all":     junk,
+		"a directory":                         adir,
+		"nothing at that name":                filepath.Join(root, "absent.tar"),
+	} {
+		if err := VerifyArchive(path, src); err == nil {
+			t.Errorf("VerifyArchive accepted %s, which would authorise dropping the source", name)
+		}
+	}
+}
+
+// Archiving reads the source and writes a new file, so the archive step itself
+// can never be a move: whatever IMPORT_MODE says, Archive leaves the source
+// where it found it and any later decision about it is the caller's.
 func TestArchiveLeavesSourceInPlace(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "Game")
