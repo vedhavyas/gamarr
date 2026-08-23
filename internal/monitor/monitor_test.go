@@ -531,3 +531,18 @@ func TestActRetryJobWithoutACallback(t *testing.T) {
 		t.Errorf("msg = %q, want it to say retry is unavailable", msg)
 	}
 }
+
+// The description is written verbatim into the model's prompt, so it has to say
+// what the action does now rather than what it did when it was a no-op.
+func TestRetryJobActionDescribesTheImport(t *testing.T) {
+	info, ok := allowedActions["retry_job"]
+	if !ok {
+		t.Fatal("retry_job is not registered")
+	}
+	if strings.Contains(strings.ToLower(info.Label), "queue") {
+		t.Errorf("label = %q, want it to describe re-running the import", info.Label)
+	}
+	if !strings.Contains(buildSystemPrompt(), info.Label) {
+		t.Error("the prompt does not carry the registered label")
+	}
+}
