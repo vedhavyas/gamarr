@@ -558,8 +558,14 @@ func importDetail(mode fileops.Mode, target string) string {
 // row here before returning either way.
 func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf, platSlug string, isPC bool) bool {
 	// Claimed here rather than in any caller, so every path that imports is
-	// excluded rather than only the one that was looked at.
-	if _, busy := m.importing.LoadOrStore(t.Hash, struct{}{}); busy {
+	// excluded rather than only the one that was looked at. The hash is what two
+	// rows naming one download share; the job id stands in when there is none,
+	// so an empty hash cannot collapse unrelated imports onto one key.
+	claim := t.Hash
+	if claim == "" {
+		claim = jobID
+	}
+	if _, busy := m.importing.LoadOrStore(claim, struct{}{}); busy {
 		slog.Warn("an import is already running for this download", "via", via, "name", sanitizeLog(t.Name))
 		// A refusal has to leave a row the user can act on: left at organizing
 		// it would carry no button, count as active and never be pruned.
@@ -569,7 +575,7 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 		})
 		return false
 	}
-	defer m.importing.Delete(t.Hash)
+	defer m.importing.Delete(claim)
 
 	// Record the hash the give-up message tells the user to retry with. The job
 	// row's own copy comes from a request parameter that is empty for any
