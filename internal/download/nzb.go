@@ -293,7 +293,7 @@ func (m *Manager) organizeNZBDownloadWithClient(jobID, storagePath, title, platf
 		os.MkdirAll(filepath.Dir(dest), 0755)
 	}
 
-	archive := isPC && m.cfg.VaultArchiveEnabled && fileops.Archivable(storagePath)
+	archive := isPC && m.vaultArchiveEnabled() && fileops.Archivable(storagePath)
 	// An archive leaves the download in staging, unlike the move it replaces, and
 	// it is deliberately not removed: a successful write to the vault says the
 	// bytes reached the mount's cache, not the remote behind it, so nothing at
