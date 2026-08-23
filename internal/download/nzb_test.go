@@ -779,8 +779,9 @@ func TestRefusedImportLeavesAnActionableRow(t *testing.T) {
 		Name: "One Download", Hash: "od-hash", Progress: 1.0,
 		SavePath: cfg.QBSavePath, ContentPath: filepath.Join(cfg.QBSavePath, "pending"),
 	}
-	// A second job row naming the same physical download, which is what
-	// OrganizeTorrent produces on a second call.
+	// A second job row naming the same physical download, carrying no hash of
+	// its own - which is what DownloadTorrent writes whenever the search result
+	// gave a .torrent URL rather than a magnet.
 	second := newJobID()
 	m.Jobs().Set(second, map[string]interface{}{"status": "organizing", "title": torrent.Name})
 
@@ -796,5 +797,11 @@ func TestRefusedImportLeavesAnActionableRow(t *testing.T) {
 	}
 	if detail, _ := job["detail"].(string); !strings.Contains(detail, "already running") {
 		t.Errorf("detail = %q, want it to say why", detail)
+	}
+	// Actionable means the UI can offer the button, and it gates that on the
+	// hash. A refusal that returned before recording it left error plus no
+	// hash, which renders nothing and refuses if reached any other way.
+	if got, _ := job["info_hash"].(string); got != torrent.Hash {
+		t.Errorf("info_hash = %q, want %q so the row keeps a usable Retry", got, torrent.Hash)
 	}
 }

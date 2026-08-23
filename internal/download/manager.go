@@ -557,6 +557,13 @@ func importDetail(mode fileops.Mode, target string) string {
 // callers that act on success, since the terminal state is written to the job
 // row here before returning either way.
 func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf, platSlug string, isPC bool) bool {
+	// Record the hash before anything can return. The job row's own copy comes
+	// from a request parameter that is empty for any result carrying a .torrent
+	// URL rather than a magnet, this is the one place holding the torrent
+	// itself, and every exit below leaves a row the UI gates on it - including
+	// the refusal, which would otherwise leave a dead end with no button.
+	m.jobs.Update(jobID, "info_hash", t.Hash)
+
 	// Claimed here rather than in any caller, so every path that imports is
 	// excluded rather than only the one that was looked at. The hash is what two
 	// rows naming one download share; the job id stands in when there is none,
@@ -576,12 +583,6 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 		return false
 	}
 	defer m.importing.Delete(claim)
-
-	// Record the hash the give-up message tells the user to retry with. The job
-	// row's own copy comes from a request parameter that is empty for any
-	// result carrying a .torrent URL rather than a magnet, and this is the one
-	// place that holds the torrent itself.
-	m.jobs.Update(jobID, "info_hash", t.Hash)
 
 	attempt := 0
 	// Empty means the import wrote its own terminal state and nothing here may
