@@ -1088,3 +1088,58 @@ func TestAdminDashboard(t *testing.T) {
 		t.Error("dashboard missing system section")
 	}
 }
+
+// The Retry button is gated on the payload saying the job has a torrent to
+// resolve. `hash` cannot answer that: it is a LIVE torrent matched to the row by
+// fuzzy title, so a release whose name differs from the job title - which is any
+// title carrying a colon, apostrophe or ampersand - loses the button while the
+// backend would retry it fine.
+func TestDownloadsReportTheJobsOwnInfoHash(t *testing.T) {
+	qb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			json.NewEncoder(w).Encode([]map[string]interface{}{
+				{"name": "Assassins.Creed.Valhalla.REPACK-KaOs", "hash": "ac-hash", "progress": 1.0},
+				{"name": "Plain Game", "hash": "pg-hash", "progress": 1.0},
+			})
+		default:
+			w.WriteHeader(200)
+		}
+	}))
+	defer qb.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.QBURL = qb.URL })
+	// The first title does not fuzzy-match its torrent name, so it lands in the
+	// unmatched branch; the second does, so it lands in the matched one. Both
+	// have to carry the hash or one of the two branches silently drops it.
+	env.jobs.Set("ac", map[string]interface{}{
+		"status": "error", "title": "Assassin's Creed: Valhalla", "info_hash": "ac-hash",
+	})
+	env.jobs.Set("pg", map[string]interface{}{
+		"status": "error", "title": "Plain Game", "info_hash": "pg-hash",
+	})
+
+	rr := env.do("GET", "/api/downloads", "")
+	wantStatus(t, rr, 200)
+	entries, _ := decodeMap(t, rr)["downloads"].([]interface{})
+
+	rows := map[string]map[string]interface{}{}
+	for _, e := range entries {
+		m, _ := e.(map[string]interface{})
+		if id, _ := m["job_id"].(string); id != "" {
+			rows[id] = m
+		}
+	}
+	for jobID, want := range map[string]string{"ac": "ac-hash", "pg": "pg-hash"} {
+		row, ok := rows[jobID]
+		if !ok {
+			t.Errorf("no entry for job %s: %v", jobID, entries)
+			continue
+		}
+		if got, _ := row["info_hash"].(string); got != want {
+			t.Errorf("job %s info_hash = %q, want %q", jobID, got, want)
+		}
+	}
+}
