@@ -391,7 +391,6 @@ func (m *Manager) completeNZBOrganize(jobID, dest, title, platf, platSlug string
 	}
 }
 
-// RetryJob retries a failed download job.
 // RetryJob re-runs a failed import on its existing job row.
 //
 // It reuses the row rather than minting a new one, since a second row for the
@@ -400,12 +399,6 @@ func (m *Manager) completeNZBOrganize(jobID, dest, title, platf, platSlug string
 // was already in: the UI offers a button for "error" and none at all for
 // "queued", so parking it there is how a click became a dead end.
 func (m *Manager) RetryJob(jobID string) (bool, string) {
-	// Reading the job and writing its new status are two separate lock
-	// acquisitions, so without this two clicks both read "error" and both start
-	// an import of the same source.
-	m.retryMu.Lock()
-	defer m.retryMu.Unlock()
-
 	job, ok := m.jobs.Get(jobID)
 	if !ok {
 		return false, "Job not found"
@@ -414,13 +407,21 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 	if status != "error" && status != "interrupted" && status != "dead_letter" {
 		return false, fmt.Sprintf("Job not in failed state (status=%s)", status)
 	}
-
-	// The status alone does not say whether an import is running: a retry that
-	// is between attempts has just written "error" and has not yet written
-	// "organizing" back.
-	if _, busy := m.importing.Load(jobID); busy {
-		return false, "An import is already running for this job"
+	// The claim is what serialises two clicks, and it has to be the check as
+	// well: the status alone cannot say whether a retry is already running,
+	// since its import writes "error" on every failed attempt before writing
+	// "organizing" back, so a click landing in that window reads a row that
+	// looks idle. LoadOrStore settles it in one atomic step.
+	if _, busy := m.retrying.LoadOrStore(jobID, struct{}{}); busy {
+		return false, "A retry is already running for this job"
 	}
+
+	started := false
+	defer func() {
+		if !started {
+			m.retrying.Delete(jobID)
+		}
+	}()
 
 	hash := strVal(job, "info_hash")
 	if hash == "" {
@@ -450,7 +451,11 @@ func (m *Manager) RetryJob(jobID string) (bool, string) {
 		"retry_count": retryCount + 1,
 	})
 	m.jobs.LogActivity("download_retried", strVal(job, "title"), fmt.Sprintf("Retry #%d", retryCount+1), jobID, nil)
-	go m.importFinishedTorrent("retry", jobID, torrent, strVal(job, "platform"), strVal(job, "platform_slug"), isPC)
+	started = true
+	go func() {
+		defer m.retrying.Delete(jobID)
+		m.importFinishedTorrent("retry", jobID, torrent, strVal(job, "platform"), strVal(job, "platform_slug"), isPC)
+	}()
 	return true, fmt.Sprintf("Retrying (#%d)", retryCount+1)
 }
 

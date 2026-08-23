@@ -11,7 +11,6 @@ import (
 
 	"gamarr/internal/qbit"
 	"gamarr/internal/sabnzbd"
-	"sync"
 )
 
 // sabMock is a fake SABnzbd API server.
@@ -552,7 +551,7 @@ func TestRetryJobImportsOnTheSameRow(t *testing.T) {
 		t.Fatalf("RetryJob refused: %s", msg)
 	}
 
-	job := waitJobStatus(t, m.Jobs(), jobID, "completed", time.Second)
+	job := waitJobStatus(t, m.Jobs(), jobID, "completed", minPollTimeout)
 	if !pathExists(filepath.Join(cfg.GamesVaultPath, "Retried Game [FitGirl Repack]", "setup.exe")) {
 		t.Error("the retry reported success without importing anything")
 	}
@@ -612,89 +611,6 @@ func TestRetryJobRefusalsLeaveTheRowActionable(t *testing.T) {
 	}
 }
 
-// Two clicks used to start two imports of one source. Whichever moved it first
-// won; the loser stat'd the emptied path, read it as missing and overwrote the
-// winner's completed row with a failure blaming the user's mounts. The game was
-// in the vault the whole time.
-func TestRetryJobConcurrentClicksCannotCorruptASuccess(t *testing.T) {
-	qm := newQbitMock(t)
-	cfg := newTestConfig(t)
-	cfg.QBURL = "configured"
-	m := New(cfg, newTestJobs(t), qm.client())
-
-	content := filepath.Join(cfg.QBSavePath, "Clicked Twice [FitGirl Repack]")
-	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
-	qm.setTorrents([]qbit.Torrent{{
-		Name: "Clicked Twice", Hash: "cc-hash", Progress: 1.0,
-		SavePath: cfg.QBSavePath, ContentPath: content,
-	}})
-
-	jobID := newJobID()
-	m.Jobs().Set(jobID, map[string]interface{}{
-		"status": "error", "title": "Clicked Twice", "info_hash": "cc-hash",
-		"platform": "PC", "is_pc": true,
-	})
-
-	var wg sync.WaitGroup
-	accepted := make(chan bool, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ok, _ := m.RetryJob(jobID)
-			accepted <- ok
-		}()
-	}
-	wg.Wait()
-	close(accepted)
-
-	starts := 0
-	for ok := range accepted {
-		if ok {
-			starts++
-		}
-	}
-	if starts != 1 {
-		t.Errorf("accepted %d of 2 concurrent clicks, want exactly one", starts)
-	}
-
-	job := waitJobStatus(t, m.Jobs(), jobID, "completed", time.Second)
-	if msg, _ := job["error"].(string); msg != "" {
-		t.Errorf("a completed import was overwritten with %q", msg)
-	}
-	if !pathExists(filepath.Join(cfg.GamesVaultPath, "Clicked Twice [FitGirl Repack]", "setup.exe")) {
-		t.Error("the import did not land")
-	}
-}
-
-// The status alone cannot say whether an import is running: a retry between
-// attempts has written "error" and not yet written "organizing" back, so a
-// click landing in that window would start a second import over the first.
-func TestImportFinishedTorrentRefusesASecondRunForTheSameJob(t *testing.T) {
-	qm := newQbitMock(t)
-	cfg := newTestConfig(t)
-	cfg.QBURL = "configured"
-	m := New(cfg, newTestJobs(t), qm.client())
-
-	torrent := qbit.Torrent{
-		Name: "Busy Game", Hash: "bz-hash", Progress: 1.0,
-		SavePath: cfg.QBSavePath, ContentPath: filepath.Join(cfg.QBSavePath, "never"),
-	}
-	jobID := newJobID()
-	m.Jobs().Set(jobID, map[string]interface{}{"status": "organizing", "title": "Busy Game"})
-
-	m.importing.Store(jobID, struct{}{})
-	defer m.importing.Delete(jobID)
-
-	if m.importFinishedTorrent("second", jobID, torrent, "PC", "", true) {
-		t.Error("ran a second import for a job already importing")
-	}
-	job, _ := m.Jobs().Get(jobID)
-	if status, _ := job["status"].(string); status != "organizing" {
-		t.Errorf("status = %q, want the row untouched by a refused import", status)
-	}
-}
-
 // The give-up message tells the user to press Retry, so the row it writes has to
 // be one Retry can act on. The hash reaches the job from a request parameter
 // that is empty for any result carrying a .torrent URL, so recording it at the
@@ -728,4 +644,79 @@ func TestGiveUpLeavesARowRetryCanActOn(t *testing.T) {
 	if _, msg := m.RetryJob(jobID); strings.Contains(msg, "no torrent recorded") {
 		t.Errorf("Retry refused the row its own message told the user to press: %s", msg)
 	}
+	// That retry spawned an import; wait for it, or it outlives the test and
+	// races the next one's setup over the shared retry budget.
+	waitFor(t, minPollTimeout, "the retry to finish", func() bool {
+		_, busy := m.retrying.Load(jobID)
+		return !busy
+	})
+}
+
+// A second click used to start a second import of one source. Whichever moved it
+// first won; the loser stat'd the emptied path, read it as missing and overwrote
+// the winner's completed row with a failure blaming the user's mounts.
+//
+// The status alone cannot say whether a retry is running: the import writes
+// "error" on every failed attempt before writing "organizing" back, and that
+// window is observable for a couple of percent of a retry's life, so a click
+// landing in it reads a row that looks idle. The claim is the check.
+func TestRetryJobRefusesASecondClickAndKeepsTheImportClean(t *testing.T) {
+	setImportRetries(t, 400, 2*time.Second)
+	qm := newQbitMock(t)
+	cfg := newTestConfig(t)
+	cfg.QBURL = "configured"
+	m := New(cfg, newTestJobs(t), qm.client())
+
+	content := filepath.Join(cfg.QBSavePath, "Clicked Twice [FitGirl Repack]")
+	torrent := qbit.Torrent{
+		Name: "Clicked Twice", Hash: "cc-hash", Progress: 1.0,
+		SavePath: cfg.QBSavePath, ContentPath: content,
+	}
+	qm.setTorrents([]qbit.Torrent{torrent})
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{
+		"status": "error", "title": "Clicked Twice", "info_hash": "cc-hash", "is_pc": true,
+	})
+
+	if ok, msg := m.RetryJob(jobID); !ok {
+		t.Fatalf("first retry refused: %s", msg)
+	}
+	// Wait until the first retry is between attempts, so it will not overwrite
+	// the row while the second click is made.
+	waitFor(t, minPollTimeout, "the first retry to reach its wait", func() bool {
+		job, _ := m.Jobs().Get(jobID)
+		detail, _ := job["detail"].(string)
+		return strings.Contains(detail, "Waiting for the download client")
+	})
+
+	// Put the row in the state the running import genuinely writes on a failed
+	// attempt. This seeds the job row, not the claim, so the claim is still what
+	// is under test.
+	m.Jobs().Update(jobID, "status", "error")
+
+	ok, msg := m.RetryJob(jobID)
+	if ok {
+		t.Fatal("a second retry started while the first was still running")
+	}
+	if !strings.Contains(msg, "already running") {
+		t.Errorf("msg = %q, want it to say a retry is already running", msg)
+	}
+
+	// The files land, so the first retry finishes on its own.
+	writeFileT(t, filepath.Join(content, "setup.exe"), []byte("installer"))
+	job := waitJobStatus(t, m.Jobs(), jobID, "completed", minPollTimeout)
+	if left, _ := job["error"].(string); left != "" {
+		t.Errorf("a completed import was overwritten with %q", left)
+	}
+	if rc, _ := job["retry_count"].(float64); rc != 1 {
+		t.Errorf("retry_count = %v, want 1 after one accepted click", rc)
+	}
+
+	// The job reads completed before the import goroutine has unwound, so wait
+	// for the claim to clear or the test's cleanup restores the retry budget
+	// while that goroutine is still reading it.
+	waitFor(t, minPollTimeout, "the retry to finish", func() bool {
+		_, busy := m.retrying.Load(jobID)
+		return !busy
+	})
 }

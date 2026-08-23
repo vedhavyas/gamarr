@@ -44,14 +44,12 @@ type Manager struct {
 	nzbget       *nzbget.Client
 	NotifyFunc   NotifyCallback
 
-	// importing holds the jobs an import is currently running for. Two imports
-	// on one job race for its source: whichever moves it first wins, and the
-	// loser stats the emptied path, reads it as missing and overwrites the
-	// winner's completed row with a failure blaming the user's mounts.
-	importing sync.Map
-	// retryMu serialises RetryJob's read-check-write, which is otherwise two
-	// separate lock acquisitions that two clicks can both pass.
-	retryMu sync.Mutex
+	// retrying holds the jobs a retry is running for, claimed under retryMu so
+	// the check and the claim are one step. Two retries on one row race for its
+	// source: whichever moves it first wins, and the loser stats the emptied
+	// path, reads it as missing and overwrites the winner's completed row with a
+	// failure blaming the user's mounts.
+	retrying sync.Map
 }
 
 // New creates a new download Manager.
@@ -562,12 +560,6 @@ func (m *Manager) importFinishedTorrent(via, jobID string, t qbit.Torrent, platf
 	// result carrying a .torrent URL rather than a magnet, and this is the one
 	// place that holds the torrent itself.
 	m.jobs.Update(jobID, "info_hash", t.Hash)
-
-	if _, busy := m.importing.LoadOrStore(jobID, struct{}{}); busy {
-		slog.Warn("an import is already running for this job", "via", via, "job", jobID)
-		return false
-	}
-	defer m.importing.Delete(jobID)
 
 	attempt := 0
 	// Empty means the import wrote its own terminal state and nothing here may
