@@ -275,6 +275,22 @@ func writeTar(f *os.File, src string) (files, bytes int64, err error) {
 	return files, bytes, err
 }
 
+// writeGNUHeader writes hdr in GNU format, which carries a size past ustar's
+// 8 GiB ceiling in the header itself. PAX instead zeroes the real size field
+// and moves the size to an extended header, which the p7zip 16.02 GameVault
+// runs ignores: it reads the member as empty and everything after it as
+// garbage. Ownership names go unconditionally, since GNU refuses one past 32
+// bytes and they are cosmetic here where the format is not; atime and ctime go
+// because they sit in the bytes a ustar reader takes for a path prefix.
+func writeGNUHeader(tw *tar.Writer, hdr *tar.Header) error {
+	hdr.ModTime = hdr.ModTime.Round(time.Second)
+	hdr.AccessTime = time.Time{}
+	hdr.ChangeTime = time.Time{}
+	hdr.Uname, hdr.Gname = "", ""
+	hdr.Format = tar.FormatGNU
+	return tw.WriteHeader(hdr)
+}
+
 // writeTree adds every file under src to tw, named relative to src, and reports
 // what it wrote so the caller can compare against the source.
 func writeTree(tw *tar.Writer, src string) (files, bytes int64, err error) {
@@ -307,9 +323,9 @@ func writeTree(tw *tar.Writer, src string) (files, bytes int64, err error) {
 		hdr.Name = filepath.ToSlash(rel)
 		if info.IsDir() {
 			hdr.Name += "/"
-			return tw.WriteHeader(hdr)
+			return writeGNUHeader(tw, hdr)
 		}
-		if err := tw.WriteHeader(hdr); err != nil {
+		if err := writeGNUHeader(tw, hdr); err != nil {
 			return err
 		}
 
