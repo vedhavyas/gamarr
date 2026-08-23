@@ -40,7 +40,10 @@ var allowedActions = map[string]struct {
 	Risk  string
 	Label string
 }{
-	"retry_job":             {"safe", "Re-run a failed download's import"},
+	// Not safe: this moves files into the vault, and under a move import the
+	// download is deleted afterwards. The only other action behind approval is
+	// restarting a container, which is recoverable where this is not.
+	"retry_job":             {"approval", "Re-run a failed download's import"},
 	"clear_interrupted":     {"safe", "Mark interrupted/stuck jobs as cleared"},
 	"reauth_qbittorrent":    {"safe", "Force qBittorrent session re-authentication"},
 	"refresh_myrient_cache": {"safe", "Clear cached Myrient directory listings"},

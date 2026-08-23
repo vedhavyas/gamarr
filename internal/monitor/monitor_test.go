@@ -532,9 +532,11 @@ func TestActRetryJobWithoutACallback(t *testing.T) {
 	}
 }
 
-// The description is written verbatim into the model's prompt, so it has to say
-// what the action does now rather than what it did when it was a no-op.
-func TestRetryJobActionDescribesTheImport(t *testing.T) {
+// Both halves reach the model's prompt verbatim, so they have to describe what
+// the action does now rather than what it did when it was a no-op. The tier is
+// what decides whether it runs unattended, and this one moves files into the
+// vault and under a move import deletes the download afterwards.
+func TestRetryJobActionDescribesAndTiersTheImport(t *testing.T) {
 	info, ok := allowedActions["retry_job"]
 	if !ok {
 		t.Fatal("retry_job is not registered")
@@ -542,7 +544,14 @@ func TestRetryJobActionDescribesTheImport(t *testing.T) {
 	if strings.Contains(strings.ToLower(info.Label), "queue") {
 		t.Errorf("label = %q, want it to describe re-running the import", info.Label)
 	}
-	if !strings.Contains(buildSystemPrompt(), info.Label) {
+	if info.Risk != "approval" {
+		t.Errorf("risk = %q, want approval: an unattended run moves files and can delete the download", info.Risk)
+	}
+	prompt := buildSystemPrompt()
+	if !strings.Contains(prompt, info.Label) {
 		t.Error("the prompt does not carry the registered label")
+	}
+	if !strings.Contains(prompt, fmt.Sprintf("%s [risk: %s]", info.Label, info.Risk)) {
+		t.Error("the prompt does not carry the label and tier together")
 	}
 }
