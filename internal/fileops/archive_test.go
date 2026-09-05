@@ -185,6 +185,24 @@ func TestArchiveSkipsQbPlaceholders(t *testing.T) {
 	}
 }
 
+// The placeholder drop is a suffix match on a real entry, not a contains: a
+// wanted file that merely contains the suffix stays in the archive.
+func TestArchiveKeepsAFileThatOnlyContainsThePlaceholderSuffix(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "readme.!qB.notes.txt"), "NOTES")
+
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, dest); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	got := readTar(t, dest)
+	if got["readme.!qB.notes.txt"] != "NOTES" {
+		t.Errorf("tar entry = %q, want the file kept in the archive", got["readme.!qB.notes.txt"])
+	}
+}
+
 // twoFileArchive builds a source of two regular files and its archive.
 func twoFileArchive(t *testing.T) (string, string, int64) {
 	t.Helper()
