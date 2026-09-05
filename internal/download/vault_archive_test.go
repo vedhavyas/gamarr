@@ -684,7 +684,7 @@ func TestOrganizeGameArchivesOnlyPriorityWantedFiles(t *testing.T) {
 	jobs.Set(jobID, map[string]interface{}{"status": "organizing", "error": nil})
 
 	torrent := &qbit.Torrent{Name: "Filtered Game", Hash: "pf1", ContentPath: content}
-	m.organizeGame(jobID, torrent, "PC", "", true)
+	m.organizeGame(jobID, torrent, "PC", "", true, 1)
 
 	got := tarEntries(t, filepath.Join(cfg.GamesVaultPath, "Filtered Game.tar"))
 	if got["setup.exe"] != "installer" || got["fg-01.bin"] != "payload" {
