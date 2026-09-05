@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"gamarr/internal/fileops"
 	"gamarr/internal/platform"
 	"gamarr/internal/qbit"
 )
@@ -1522,6 +1523,64 @@ func TestImportWithTheContentStillPresentStaysTerminal(t *testing.T) {
 	}
 	if strings.Contains(detail, "Gave up") {
 		t.Errorf("detail = %q, want no give-up: the tree was in place, so the first attempt is terminal", detail)
+	}
+}
+
+// The ROM arm classifies the publish race the same way the vault arm does, and
+// a retry there lands the published tree in the ROM library.
+func TestRomImportRetriesWhenTheClientMovesThePayload(t *testing.T) {
+	setImportRetries(t, 400, 5*time.Millisecond)
+	qm := newQbitMock(t)
+	cfg := newTestConfig(t)
+	cfg.QBURL = "configured"
+	m := New(cfg, newTestJobs(t), qm.client())
+
+	stale := filepath.Join(cfg.QBSavePath, "temp", "Super Game (USA)")
+	published := filepath.Join(cfg.QBSavePath, "Super Game (USA)")
+	if err := os.MkdirAll(stale, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", stale, err)
+	}
+	if err := os.MkdirAll(published, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", published, err)
+	}
+	if err := os.WriteFile(filepath.Join(published, "game.sfc"), []byte("rom-data"), 0644); err != nil {
+		t.Fatalf("write game.sfc: %v", err)
+	}
+
+	qm.setTorrents([]qbit.Torrent{{
+		Name: "Super Game (USA)", Hash: "rom-hash", Progress: 1.0,
+		SavePath: cfg.QBSavePath, ContentPath: published,
+	}})
+	jobID := newJobID()
+	m.Jobs().Set(jobID, map[string]interface{}{
+		"status": "downloading", "title": "Super Game (USA)", "info_hash": "rom-hash",
+	})
+
+	// First attempt reads the staging tree, which the client's move takes away
+	// under it; the published tree is the only one that can complete.
+	realImport := fileImport
+	attempts := 0
+	fileImport = func(src, dest string, opt fileops.Options) error {
+		attempts++
+		if attempts == 1 {
+			os.RemoveAll(src)
+			return fmt.Errorf("copy of %s interrupted by the client", src)
+		}
+		return realImport(src, dest, opt)
+	}
+	t.Cleanup(func() { fileImport = realImport })
+
+	m.importFinishedTorrent("job watch", jobID, qbit.Torrent{
+		Name: "Super Game (USA)", Hash: "rom-hash", Progress: 1.0,
+		SavePath: cfg.QBSavePath, ContentPath: stale,
+	}, "SNES", "snes", false)
+
+	if attempts < 2 {
+		t.Errorf("import attempts = %d, want the failed one retried at the published path", attempts)
+	}
+	waitJobStatus(t, m.Jobs(), jobID, "completed", minPollTimeout)
+	if !pathExists(filepath.Join(cfg.GamesRomsPath, "snes", "Super Game (USA)", "game.sfc")) {
+		t.Error("game file not at the ROM destination after the retried import")
 	}
 }
 
