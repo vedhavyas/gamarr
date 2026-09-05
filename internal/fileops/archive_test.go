@@ -203,6 +203,53 @@ func TestArchiveKeepsAFileThatOnlyContainsThePlaceholderSuffix(t *testing.T) {
 	}
 }
 
+// The suffix only drops regular files: a symlink wearing it keeps the loud
+// refusal, and a directory wearing it keeps its whole subtree.
+func TestArchivePlaceholderSuffixOnlyDropsRegularFiles(t *testing.T) {
+	t.Run("a suffix-wearing symlink is refused loudly", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "Game")
+		writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+		if err := os.Symlink(filepath.Join(src, "missing"), filepath.Join(src, "pack.!qB")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		err := Archive(src, ArchiveDest(filepath.Join(root, "vault", "Game")))
+		if err == nil {
+			t.Fatal("Archive accepted a suffix-wearing symlink it should refuse")
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("error = %v, want the regular-file refusal", err)
+		}
+	})
+
+	t.Run("a suffix-wearing directory keeps its subtree", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "Game")
+		writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+		if err := os.MkdirAll(filepath.Join(src, "Bonus.!qB"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		writeFile(t, filepath.Join(src, "Bonus.!qB", "inner.txt"), "INNER")
+
+		dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+		if err := Archive(src, dest); err != nil {
+			t.Fatalf("Archive: %v", err)
+		}
+
+		got := readTar(t, dest)
+		if got["setup.exe"] != "SETUP" {
+			t.Error("tar lost setup.exe")
+		}
+		if _, ok := got["Bonus.!qB/"]; !ok {
+			t.Error("the directory entry wearing the suffix is missing from the tar")
+		}
+		if got["Bonus.!qB/inner.txt"] != "INNER" {
+			t.Error("a directory wearing the suffix lost its subtree")
+		}
+	})
+}
+
 // twoFileArchive builds a source of two regular files and its archive.
 func twoFileArchive(t *testing.T) (string, string, int64) {
 	t.Helper()
