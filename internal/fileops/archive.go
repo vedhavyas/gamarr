@@ -20,8 +20,9 @@ const TarExt = ".tar"
 // partialSuffix marks an archive that is still being written.
 const partialSuffix = ".partial"
 
-// qBPartSuffix marks a file the download client preallocated but never
-// downloaded: the zero-filled placeholder left where a deselected pack sits.
+// qBPartSuffix marks a file the client preallocated but never downloaded. A
+// real file can also carry it (qB renames foo.!qB.!qB to foo.!qB at
+// completion), so the walk logs each skip instead of dropping one silently.
 const qBPartSuffix = ".!qB"
 
 // ErrDestinationOccupied reports that the library already holds something at
@@ -341,15 +342,16 @@ func writeTree(tw *tar.Writer, src string) (files, bytes int64, err error) {
 		if !filepath.IsLocal(rel) {
 			return fmt.Errorf("unsafe path %q escapes %q", rel, src)
 		}
-		// qBittorrent leaves the placeholder at full preallocated size for a
-		// file that was deselected; a wanted file never carries the suffix.
-		if strings.HasSuffix(info.Name(), qBPartSuffix) {
-			return nil
-		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			// Skipping one and returning success is the worse failure: on the
 			// usenet path a nil return authorizes deleting the source.
 			return fmt.Errorf("refusing to archive %s: %s is not a regular file", src, rel)
+		}
+		// Only a regular entry drops: a directory or symlink wearing the
+		// suffix keeps the treatment above, and its subtree keeps its files.
+		if !info.IsDir() && strings.HasSuffix(info.Name(), qBPartSuffix) {
+			slog.Warn("skipping a download-client placeholder", "file", rel)
+			return nil
 		}
 
 		hdr, err := tar.FileInfoHeader(info, "")
