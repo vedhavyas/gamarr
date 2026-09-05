@@ -341,15 +341,15 @@ func writeTree(tw *tar.Writer, src string) (files, bytes int64, err error) {
 		if !filepath.IsLocal(rel) {
 			return fmt.Errorf("unsafe path %q escapes %q", rel, src)
 		}
-		// qBittorrent leaves the placeholder at full preallocated size for a
-		// file that was deselected; a wanted file never carries the suffix.
-		if strings.HasSuffix(info.Name(), qBPartSuffix) {
-			return nil
-		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			// Skipping one and returning success is the worse failure: on the
 			// usenet path a nil return authorizes deleting the source.
 			return fmt.Errorf("refusing to archive %s: %s is not a regular file", src, rel)
+		}
+		// Only a regular entry drops: a directory or symlink wearing the
+		// suffix keeps the treatment above, and its subtree keeps its files.
+		if !info.IsDir() && strings.HasSuffix(info.Name(), qBPartSuffix) {
+			return nil
 		}
 
 		hdr, err := tar.FileInfoHeader(info, "")
