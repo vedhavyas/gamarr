@@ -157,16 +157,26 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 	}
 }
 
-// A deselected pack is a zero-filled placeholder at its full preallocated
-// extent carrying the client's partial suffix. It never belongs in the vault
-// archive, and the census that authorises dropping the download has to count
-// the tar the same way the walk wrote it.
+// A deselected pack is zero-filled at its preallocated extent; a real file
+// wearing the same suffix is archived by content. Census, walk and verify all
+// probe through one helper, so the three faces are: nonzero archived,
+// zero-filled skipped, empty skipped.
 func TestArchiveSkipsQbPlaceholders(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "Days Gone")
 	writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
 	writeFile(t, filepath.Join(src, "fg-01.bin"), "PART ONE")
-	writeFile(t, filepath.Join(src, "fg-02.bin"+qBPartSuffix), "PLACEHOLDER")
+
+	zero := make([]byte, 4096)
+	if err := os.WriteFile(filepath.Join(src, "fg-02.bin"+qBPartSuffix), zero, 0644); err != nil {
+		t.Fatalf("write placeholder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "fg-03.bin"+qBPartSuffix), nil, 0644); err != nil {
+		t.Fatalf("write empty placeholder: %v", err)
+	}
+	// A real payload that only wears the suffix: qB renames foo.!qB.!qB to
+	// foo.!qB at completion.
+	writeFile(t, filepath.Join(src, "fg-04.bin"+qBPartSuffix), "REAL PAYLOAD")
 
 	dest := ArchiveDest(filepath.Join(root, "vault", "Days Gone"))
 	if err := Archive(src, dest); err != nil {
@@ -175,7 +185,13 @@ func TestArchiveSkipsQbPlaceholders(t *testing.T) {
 
 	got := readTar(t, dest)
 	if _, ok := got["fg-02.bin"+qBPartSuffix]; ok {
-		t.Error("tar carries the deselected pack placeholder")
+		t.Error("tar carries the zero-filled placeholder")
+	}
+	if _, ok := got["fg-03.bin"+qBPartSuffix]; ok {
+		t.Error("tar carries the empty placeholder")
+	}
+	if got["fg-04.bin"+qBPartSuffix] != "REAL PAYLOAD" {
+		t.Error("tar lost a real file that only wears the placeholder suffix")
 	}
 	if got["setup.exe"] != "SETUP" || got["fg-01.bin"] != "PART ONE" {
 		t.Errorf("tar lost a wanted file: %v", got)
@@ -183,6 +199,71 @@ func TestArchiveSkipsQbPlaceholders(t *testing.T) {
 	if err := VerifyArchive(dest, src); err != nil {
 		t.Errorf("VerifyArchive: %v", err)
 	}
+}
+
+// The placeholder drop is a suffix match on a real entry, not a contains: a
+// wanted file that merely contains the suffix stays in the archive.
+func TestArchiveKeepsAFileThatOnlyContainsThePlaceholderSuffix(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "Game")
+	writeFile(t, filepath.Join(src, "readme.!qB.notes.txt"), "NOTES")
+
+	dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+	if err := Archive(src, dest); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	got := readTar(t, dest)
+	if got["readme.!qB.notes.txt"] != "NOTES" {
+		t.Errorf("tar entry = %q, want the file kept in the archive", got["readme.!qB.notes.txt"])
+	}
+}
+
+// The suffix only drops regular files: a symlink wearing it keeps the loud
+// refusal, and a directory wearing it keeps its whole subtree.
+func TestArchivePlaceholderSuffixOnlyDropsRegularFiles(t *testing.T) {
+	t.Run("a suffix-wearing symlink is refused loudly", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "Game")
+		writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+		if err := os.Symlink(filepath.Join(src, "missing"), filepath.Join(src, "pack.!qB")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		err := Archive(src, ArchiveDest(filepath.Join(root, "vault", "Game")))
+		if err == nil {
+			t.Fatal("Archive accepted a suffix-wearing symlink it should refuse")
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("error = %v, want the regular-file refusal", err)
+		}
+	})
+
+	t.Run("a suffix-wearing directory keeps its subtree", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "Game")
+		writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
+		if err := os.MkdirAll(filepath.Join(src, "Bonus.!qB"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		writeFile(t, filepath.Join(src, "Bonus.!qB", "inner.txt"), "INNER")
+
+		dest := ArchiveDest(filepath.Join(root, "vault", "Game"))
+		if err := Archive(src, dest); err != nil {
+			t.Fatalf("Archive: %v", err)
+		}
+
+		got := readTar(t, dest)
+		if got["setup.exe"] != "SETUP" {
+			t.Error("tar lost setup.exe")
+		}
+		if _, ok := got["Bonus.!qB/"]; !ok {
+			t.Error("the directory entry wearing the suffix is missing from the tar")
+		}
+		if got["Bonus.!qB/inner.txt"] != "INNER" {
+			t.Error("a directory wearing the suffix lost its subtree")
+		}
+	})
 }
 
 // twoFileArchive builds a source of two regular files and its archive.

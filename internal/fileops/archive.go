@@ -20,9 +20,49 @@ const TarExt = ".tar"
 // partialSuffix marks an archive that is still being written.
 const partialSuffix = ".partial"
 
-// qBPartSuffix marks a file the download client preallocated but never
-// downloaded: the zero-filled placeholder left where a deselected pack sits.
+// qBPartSuffix marks a file the client preallocated but never downloaded.
+// The name alone is not proof - a real file can wear it too (qB renames
+// foo.!qB.!qB to foo.!qB at completion) - so suffix-named entries are probed
+// by content: zero-filled drops, any nonzero byte archives.
 const qBPartSuffix = ".!qB"
+
+// placeholderProbe reports whether a suffix-named regular file is a deselected
+// download placeholder: zero-filled at its preallocated extent. Any nonzero
+// byte in the head or tail makes it a real file that only wears the name. An
+// unreadable file reports real, so the walk fails loudly rather than the
+// content silently dropping.
+func placeholderProbe(path string, size int64) bool {
+	if size == 0 {
+		return true
+	}
+	const probeLen = 8 * 1024
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	buf := make([]byte, probeLen)
+	read := func(offset int64) bool {
+		n, err := f.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			return false
+		}
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	if !read(0) {
+		return false
+	}
+	if size > probeLen && !read(size-probeLen) {
+		return false
+	}
+	return true
+}
 
 // ErrDestinationOccupied reports that the library already holds something at
 // this destination. One sentinel covers the vault in either layout and the ROM
@@ -280,12 +320,12 @@ var censusOf = census
 // census counts the regular files under src and their total size: the figures a
 // finished archive has to match before it can stand in for the source.
 func census(src string) (files, bytes int64, err error) {
-	err = filepath.Walk(src, func(_ string, info fs.FileInfo, err error) error {
+	err = filepath.Walk(src, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.Mode().IsRegular() {
-			if strings.HasSuffix(info.Name(), qBPartSuffix) {
+			if strings.HasSuffix(info.Name(), qBPartSuffix) && placeholderProbe(path, info.Size()) {
 				return nil
 			}
 			files++
@@ -341,15 +381,16 @@ func writeTree(tw *tar.Writer, src string) (files, bytes int64, err error) {
 		if !filepath.IsLocal(rel) {
 			return fmt.Errorf("unsafe path %q escapes %q", rel, src)
 		}
-		// qBittorrent leaves the placeholder at full preallocated size for a
-		// file that was deselected; a wanted file never carries the suffix.
-		if strings.HasSuffix(info.Name(), qBPartSuffix) {
-			return nil
-		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			// Skipping one and returning success is the worse failure: on the
 			// usenet path a nil return authorizes deleting the source.
 			return fmt.Errorf("refusing to archive %s: %s is not a regular file", src, rel)
+		}
+		// Only a regular entry drops: a directory or symlink wearing the
+		// suffix keeps the treatment above, and its subtree keeps its files.
+		if !info.IsDir() && strings.HasSuffix(info.Name(), qBPartSuffix) && placeholderProbe(path, info.Size()) {
+			slog.Warn("skipping a zero-filled deselected placeholder", "file", rel)
+			return nil
 		}
 
 		hdr, err := tar.FileInfoHeader(info, "")
