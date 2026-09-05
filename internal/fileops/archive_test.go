@@ -157,16 +157,26 @@ func TestArchiveHoldsEveryInputFile(t *testing.T) {
 	}
 }
 
-// A deselected pack is a zero-filled placeholder at its full preallocated
-// extent carrying the client's partial suffix. It never belongs in the vault
-// archive, and the census that authorises dropping the download has to count
-// the tar the same way the walk wrote it.
+// A deselected pack is zero-filled at its preallocated extent; a real file
+// wearing the same suffix is archived by content. Census, walk and verify all
+// probe through one helper, so the three faces are: nonzero archived,
+// zero-filled skipped, empty skipped.
 func TestArchiveSkipsQbPlaceholders(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "Days Gone")
 	writeFile(t, filepath.Join(src, "setup.exe"), "SETUP")
 	writeFile(t, filepath.Join(src, "fg-01.bin"), "PART ONE")
-	writeFile(t, filepath.Join(src, "fg-02.bin"+qBPartSuffix), "PLACEHOLDER")
+
+	zero := make([]byte, 4096)
+	if err := os.WriteFile(filepath.Join(src, "fg-02.bin"+qBPartSuffix), zero, 0644); err != nil {
+		t.Fatalf("write placeholder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "fg-03.bin"+qBPartSuffix), nil, 0644); err != nil {
+		t.Fatalf("write empty placeholder: %v", err)
+	}
+	// A real payload that only wears the suffix: qB renames foo.!qB.!qB to
+	// foo.!qB at completion.
+	writeFile(t, filepath.Join(src, "fg-04.bin"+qBPartSuffix), "REAL PAYLOAD")
 
 	dest := ArchiveDest(filepath.Join(root, "vault", "Days Gone"))
 	if err := Archive(src, dest); err != nil {
@@ -175,7 +185,13 @@ func TestArchiveSkipsQbPlaceholders(t *testing.T) {
 
 	got := readTar(t, dest)
 	if _, ok := got["fg-02.bin"+qBPartSuffix]; ok {
-		t.Error("tar carries the deselected pack placeholder")
+		t.Error("tar carries the zero-filled placeholder")
+	}
+	if _, ok := got["fg-03.bin"+qBPartSuffix]; ok {
+		t.Error("tar carries the empty placeholder")
+	}
+	if got["fg-04.bin"+qBPartSuffix] != "REAL PAYLOAD" {
+		t.Error("tar lost a real file that only wears the placeholder suffix")
 	}
 	if got["setup.exe"] != "SETUP" || got["fg-01.bin"] != "PART ONE" {
 		t.Errorf("tar lost a wanted file: %v", got)
